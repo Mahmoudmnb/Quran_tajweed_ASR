@@ -1,0 +1,10 @@
+datasets/
+CODS/encoder_reivew_app/
+CODS/LSTM/kaggle/
+CODS/LSTM/__pycache__/
+CODS/LSTM/quran_train.csv
+CODS/LSTM/quran_ds_with_phonemes.csv
+CODS/HMM/phoneme_HMMs.pkl
+CODS/HMM/training_data.pkl
+voice_example/
+test_ds.zip
