@@ -228,7 +228,7 @@ MUQATTAAT = {
     "حم": ["ħaa", "mii", "m"],
     "ق": ["qaa", "f"],
     "ن": ["nuu", "n"],
-    "عسق": ["؟a", "yii", "n", "sii", "n", "qaa", "f"],
+    "عسق": ["ʕa", "yii", "n", "sii", "n", "qaa", "f"],
 }
 
 
@@ -266,7 +266,7 @@ CONSONANTS: List[str] = [
     "h",
     "w",
     "y",
-    "T"
+    "T",
 ]
 
 SUN_LETTERS = {"ت", "ث", "د", "ذ", "ر", "ز", "س", "ش", "ص", "ض", "ط", "ظ", "ل", "ن"}
@@ -1245,7 +1245,6 @@ def text_to_phonemes_with_mapping(
     phonemes = []
     metadata = []
     block_next_madd = False
-    last_vowel = None
 
     # Iterate character-by-character
     i = 0
@@ -1253,6 +1252,11 @@ def text_to_phonemes_with_mapping(
     current_word_start = 0
 
     while i < len(chars):
+
+        if for_debug:
+            print("\n--- STEP ---")
+            print(f"i={i}, char='{chars[i]}'")
+            print("phonemes so far:", phonemes)
 
         ph, i = encode_Moqatta_letters(chars, i)
         if len(ph) > 0:
@@ -1266,8 +1270,14 @@ def text_to_phonemes_with_mapping(
         block_next_madd = False
 
         # Pre-mapping handles special cases; if handled, move on
-        handled, i = _handle_pre_mapping(chars, i, phonemes, metadata)
+        handled, new_i = _handle_pre_mapping(chars, i, phonemes, metadata)
         if handled:
+
+            if for_debug:
+                print(f"[PRE-MAP] handled at i={i} → new_i={new_i}")
+                print("phonemes now:", phonemes)
+
+            i = new_i
             continue
 
         ch = chars[i]
@@ -1293,6 +1303,8 @@ def text_to_phonemes_with_mapping(
 
         # Base consonant phoneme
         base = ARABIC_TO_PHONEME[ch]
+        if for_debug:
+            print(f"[BASE] char={ch} → base={base}")
         i += 1
 
         # Collect trailing diacritics attached to this letter
@@ -1304,6 +1316,7 @@ def text_to_phonemes_with_mapping(
 
         # Resolve short vowel or tanween, if any
         short_vowel = _short_vowel_from_diacritics(diacs)
+
         tanween = _tanween_from_diacritics(diacs)
 
         # Shadda duplicates the consonant
@@ -1333,43 +1346,39 @@ def text_to_phonemes_with_mapping(
             short_vowel == "a"
             and i < len(chars)
             and chars[i] == LONG_ALIF
-            # ❗ NEW: do NOT treat as madd if this alif is part of "ال"
-            # and not (i + 1 < len(chars) and chars[i + 1] == "ل")
             and not _is_prefix_plus_al(chars, i)
             and _is_real_madd_context(chars, i)
             and _is_pure_madd_letter(chars, i)
         ):
+
+            if for_debug:
+                print(f"[EMIT] {ch} + {short_vowel} → {ph}")
+
             phonemes.append(base + "aa")
             _append_meta(metadata, ch, char_index, True)
             i += 1
             continue
 
         # Kasra + Ya → ii (STRICT madd only)
-        if (
-            short_vowel == "i"
-            and i < len(chars)
-            and chars[i] == LONG_YA
-            and not current_block_madd
-        ):
+        if short_vowel == "i" and i < len(chars) and chars[i] == LONG_YA:
 
-            # 🔍 check if there is ANOTHER ya after this one
+            # 🔥 CASE 1: doubled ya (critical for يحيي)
             lookahead = i + 1
 
-            # skip diacritics
             while lookahead < len(chars) and chars[lookahead] in DIACRITICS:
                 lookahead += 1
 
-            # ❌ CASE: يِ + ي + ي  → NOT madd
             if lookahead < len(chars) and chars[lookahead] == LONG_YA:
-                # ✅ emit normal short vowel
+                # ✅ first ya = NORMAL syllable
                 phonemes.append(base + "i")
                 _append_meta(metadata, ch, char_index, False)
+
+                # DO NOT consume madd here
                 continue
 
-            # ✅ REAL madd
+            # 🔥 CASE 2: REAL madd
             if _is_pure_madd_letter(chars, i):
                 phonemes.append(base + "ii")
-                last_vowel = "ii"
                 _append_meta(metadata, ch, char_index, True)
                 i += 1
                 continue
@@ -1381,6 +1390,10 @@ def text_to_phonemes_with_mapping(
             and chars[i] == LONG_WAW
             and _is_pure_madd_letter(chars, i)
         ):
+
+            if for_debug:
+                print(f"[EMIT] {ch} + {short_vowel} → {ph}")
+
             if core_word in NO_MADD_U_WAW_WORDS:
                 # ❌ No madd, and waw is NOT pronounced
                 phonemes.append(base + "u")
@@ -1466,28 +1479,26 @@ def text_to_phonemes_with_mapping(
 
             # ✅ FALLBACK (CRITICAL FIX)
             if not applied:
-                phonemes.append(base + short_vowel)
+                ph = base + short_vowel
+                if for_debug:
+                    print(f"[EMIT] {ch} + {short_vowel} → {ph}")
+                phonemes.append(ph)
                 _append_meta(metadata, ch, char_index, False)
 
             continue
 
-        # Short vowel on the consonant
         if short_vowel:
-            phonemes.append(base + short_vowel)
+            ph = base + short_vowel
+            if for_debug:
+                print(f"[EMIT] {ch} + {short_vowel} → {ph}")
+            phonemes.append(ph)
             _append_meta(metadata, ch, char_index, False)
-            last_vowel = short_vowel
             continue
 
-        # Consonant without vowel
-        # 🔥 Standalone madd ya (after kasra sound)
-        if ch == LONG_YA and last_vowel == "i":
-            phonemes.append("yii")
-            _append_meta(metadata, ch, char_index, True)
-            last_vowel = "ii"
-            continue
+        if for_debug:
+            print(f"[EMIT] {ch} + {short_vowel} → {ph}")
 
         phonemes.append(base)
-        last_vowel = None
 
         _append_meta(metadata, ch, char_index, False)
 
@@ -1495,22 +1506,22 @@ def text_to_phonemes_with_mapping(
 
     # POST-PROCESSING (DEBUG CONTROL)
     # -------------------
-    if not for_debug:
-        filtered_phonemes = []
-        filtered_metadata = []
+    # if not for_debug:
+    #     filtered_phonemes = []
+    #     filtered_metadata = []
 
-        for ph, meta in zip(phonemes, metadata):
-            if ph in {WASL, SPACE_TOKEN}:
-                continue
-            filtered_phonemes.append(ph)
-            filtered_metadata.append(meta)
+    #     for ph, meta in zip(phonemes, metadata):
+    #         if ph in {WASL, SPACE_TOKEN}:
+    #             continue
+    #         filtered_phonemes.append(ph)
+    #         filtered_metadata.append(meta)
 
-        phonemes = filtered_phonemes
-        metadata = filtered_metadata
+    #     phonemes = filtered_phonemes
+    #     metadata = filtered_metadata
     return phonemes, metadata
 
 
-def test_encoder():
+def test_encoder(for_debug=True):
 
     test_words = {
         "ثُمَّ اتَّبَعُوا": ["θu", "m", "ma", "<space>", "<wasl>", "t", "ta", "ba", "ʕuu"],
@@ -1641,7 +1652,7 @@ def test_encoder():
 
     for word, phoneme in test_words.items():
 
-        ph, _ = text_to_phonemes_with_mapping(word)
+        ph, _ = text_to_phonemes_with_mapping(word, for_debug=for_debug)
         if phoneme != ph:
             print("=" * 100)
             print("correct encoding : ")

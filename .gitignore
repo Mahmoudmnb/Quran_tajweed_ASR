@@ -4,3 +4,4 @@ CODS/HMM/phoneme_HMMs.pkl
 CODS/HMM/training_data.pkl
 voice_example/
 models/
+CODS/__pycache__/
