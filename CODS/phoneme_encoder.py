@@ -1235,7 +1235,6 @@ def encode_Moqatta_letters(text, i):
 
 def text_to_phonemes_with_mapping(
     text: str,
-    for_debug=True,
 ) -> Tuple[List[str], List[Dict[str, object]]]:
 
     # Normalize text first (remove marks, unify spacing)
@@ -1253,11 +1252,6 @@ def text_to_phonemes_with_mapping(
 
     while i < len(chars):
 
-        if for_debug:
-            print("\n--- STEP ---")
-            print(f"i={i}, char='{chars[i]}'")
-            print("phonemes so far:", phonemes)
-
         ph, i = encode_Moqatta_letters(chars, i)
         if len(ph) > 0:
             phonemes.append(SPACE_TOKEN)
@@ -1272,10 +1266,6 @@ def text_to_phonemes_with_mapping(
         # Pre-mapping handles special cases; if handled, move on
         handled, new_i = _handle_pre_mapping(chars, i, phonemes, metadata)
         if handled:
-
-            if for_debug:
-                print(f"[PRE-MAP] handled at i={i} → new_i={new_i}")
-                print("phonemes now:", phonemes)
 
             i = new_i
             continue
@@ -1303,8 +1293,7 @@ def text_to_phonemes_with_mapping(
 
         # Base consonant phoneme
         base = ARABIC_TO_PHONEME[ch]
-        if for_debug:
-            print(f"[BASE] char={ch} → base={base}")
+
         i += 1
 
         # Collect trailing diacritics attached to this letter
@@ -1351,9 +1340,6 @@ def text_to_phonemes_with_mapping(
             and _is_pure_madd_letter(chars, i)
         ):
 
-            if for_debug:
-                print(f"[EMIT] {ch} + {short_vowel} → {ph}")
-
             phonemes.append(base + "aa")
             _append_meta(metadata, ch, char_index, True)
             i += 1
@@ -1390,9 +1376,6 @@ def text_to_phonemes_with_mapping(
             and chars[i] == LONG_WAW
             and _is_pure_madd_letter(chars, i)
         ):
-
-            if for_debug:
-                print(f"[EMIT] {ch} + {short_vowel} → {ph}")
 
             if core_word in NO_MADD_U_WAW_WORDS:
                 # ❌ No madd, and waw is NOT pronounced
@@ -1480,8 +1463,7 @@ def text_to_phonemes_with_mapping(
             # ✅ FALLBACK (CRITICAL FIX)
             if not applied:
                 ph = base + short_vowel
-                if for_debug:
-                    print(f"[EMIT] {ch} + {short_vowel} → {ph}")
+               
                 phonemes.append(ph)
                 _append_meta(metadata, ch, char_index, False)
 
@@ -1489,14 +1471,10 @@ def text_to_phonemes_with_mapping(
 
         if short_vowel:
             ph = base + short_vowel
-            if for_debug:
-                print(f"[EMIT] {ch} + {short_vowel} → {ph}")
+           
             phonemes.append(ph)
             _append_meta(metadata, ch, char_index, False)
             continue
-
-        if for_debug:
-            print(f"[EMIT] {ch} + {short_vowel} → {ph}")
 
         phonemes.append(base)
 
