@@ -29,10 +29,9 @@ import os
 # %%
 # ? this is for local training
 
-MODEL_PATH = "../../models/count_checkpoint.pth"
+MODEL_PATH = "../../models/best_checkpoint_with_count_head.pth"
 WORKING_MODEL_PATH = "../../models/checkpoint.pth"
 WORKING_BEST_MODEL_PATH = "../../models/best_checkpoint.pth"
-COUNT_MODEL_PATH = "../../models/best_count_checkpoint.pth"
 
 DATASET_PATH = "../../datasets/Quran_ds/Quran_ds/audio/audio/"
 DATASET_PATH_1 = "../../datasets/Quran_ds/Quran_ds/audio/audio/"
@@ -881,21 +880,19 @@ class ASRModel(torch.nn.Module):
         input_lengths,
         target_lengths=None,
         count_only=False,
+        return_count=False,
     ):
-        hidden, hidden_lengths = (
-            self.encode_audio(
-                waveforms,
-                input_lengths,
-            )
+        hidden, hidden_lengths = self.encode_audio(
+            waveforms,
+            input_lengths,
         )
     
-        predicted_counts = (
-            self.predict_phoneme_count(
-                hidden,
-                hidden_lengths,
-            )
+        predicted_counts = self.predict_phoneme_count(
+            hidden,
+            hidden_lengths,
         )
     
+        # Used when evaluating only the count head.
         if count_only:
             return (
                 predicted_counts,
@@ -905,10 +902,9 @@ class ASRModel(torch.nn.Module):
         (
             segment_embedding,
             progress_weights,
-        ) = self.segmentation(
-            hidden
-        )
+        ) = self.segmentation(hidden)
     
+        # Training/evaluation with known target length.
         if target_lengths is not None:
             (
                 pooled_batch,
@@ -922,11 +918,18 @@ class ASRModel(torch.nn.Module):
             )
     
             logits_batch = [
-                self.segment_classifier(
-                    pooled
-                )
+                self.segment_classifier(pooled)
                 for pooled in pooled_batch
             ]
+    
+            if return_count:
+                return (
+                    logits_batch,
+                    segment_lengths,
+                    hard_boundaries_batch,
+                    hidden_lengths,
+                    predicted_counts,
+                )
     
             return (
                 logits_batch,
@@ -935,6 +938,7 @@ class ASRModel(torch.nn.Module):
                 hidden_lengths,
             )
     
+        # Real inference: no target length is supplied.
         predicted_lengths = torch.round(
             predicted_counts
         ).long()
@@ -961,9 +965,7 @@ class ASRModel(torch.nn.Module):
         )
     
         logits_batch = [
-            self.segment_classifier(
-                pooled
-            )
+            self.segment_classifier(pooled)
             for pooled in pooled_batch
         ]
     
@@ -1037,161 +1039,871 @@ val_loader = DataLoader(
 def save_checkpoint(
     model,
     optimizer,
-    epoch,
-    val_loss,
-    best_val_loss,
-    epochs_no_improve,
     warmup_scheduler,
     plateau_scheduler,
+    accelerator,
+    epoch,
+    train_metrics,
+    validation_metrics,
+    best_validation_per,
     path,
 ):
-    os.makedirs(
-        os.path.dirname(path),
-        exist_ok=True,
+    directory = os.path.dirname(
+        path
+    )
+
+    if directory:
+        os.makedirs(
+            directory,
+            exist_ok=True,
+        )
+
+    unwrapped_model = (
+        accelerator.unwrap_model(model)
     )
 
     torch.save(
         {
             "epoch": epoch,
-            "model_state": model.state_dict(),
-            "optimizer_state": optimizer.state_dict(),
-            "warmup_scheduler_state": warmup_scheduler.state_dict(),
-            "plateau_scheduler_state": plateau_scheduler.state_dict(),
-            "val_loss": val_loss,
-            "best_val_loss": best_val_loss,
-            "epochs_no_improve": epochs_no_improve,
+            "model_state": (
+                unwrapped_model.state_dict()
+            ),
+            "optimizer_state": (
+                optimizer.state_dict()
+            ),
+            "warmup_scheduler_state": (
+                warmup_scheduler.state_dict()
+            ),
+            "plateau_scheduler_state": (
+                plateau_scheduler.state_dict()
+            ),
+            "train_metrics": (
+                train_metrics
+            ),
+            "validation_metrics": (
+                validation_metrics
+            ),
+            "best_validation_per": (
+                best_validation_per
+            ),
         },
         path,
     )
-
-def load_checkpoint(path):
+    
     checkpoint = torch.load(path)
     return checkpoint
 
+def load_checkpoint(
+    path,
+    model,
+    accelerator,
+    optimizer=None,
+    warmup_scheduler=None,
+    plateau_scheduler=None,
+    resume_training=True,
+    strict=True,
+):
+    if not os.path.isfile(path):
+        raise FileNotFoundError(
+            f"Checkpoint was not found: {path}"
+        )
+
+    accelerator.wait_for_everyone()
+
+    checkpoint = torch.load(
+        path,
+        map_location="cpu",
+        weights_only=False,
+    )
+
+    if "model_state" not in checkpoint:
+        raise KeyError(
+            "Checkpoint does not contain 'model_state'"
+        )
+
+    unwrapped_model = accelerator.unwrap_model(
+        model
+    )
+
+    load_result = unwrapped_model.load_state_dict(
+        checkpoint["model_state"],
+        strict=strict,
+    )
+
+    if resume_training:
+        if optimizer is None:
+            raise ValueError(
+                "optimizer must be provided when "
+                "resume_training=True"
+            )
+
+        if "optimizer_state" not in checkpoint:
+            raise KeyError(
+                "Checkpoint does not contain "
+                "'optimizer_state'"
+            )
+
+        optimizer.load_state_dict(
+            checkpoint["optimizer_state"]
+        )
+
+        if warmup_scheduler is not None:
+            if (
+                "warmup_scheduler_state"
+                in checkpoint
+            ):
+                warmup_scheduler.load_state_dict(
+                    checkpoint[
+                        "warmup_scheduler_state"
+                    ]
+                )
+            else:
+                raise KeyError(
+                    "Checkpoint does not contain "
+                    "'warmup_scheduler_state'"
+                )
+
+        if plateau_scheduler is not None:
+            if (
+                "plateau_scheduler_state"
+                in checkpoint
+            ):
+                plateau_scheduler.load_state_dict(
+                    checkpoint[
+                        "plateau_scheduler_state"
+                    ]
+                )
+            else:
+                raise KeyError(
+                    "Checkpoint does not contain "
+                    "'plateau_scheduler_state'"
+                )
+
+    start_epoch = int(
+        checkpoint.get(
+            "epoch",
+            -1,
+        )
+    ) + 1
+
+    best_validation_per = float(
+        checkpoint.get(
+            "best_validation_per",
+            float("inf"),
+        )
+    )
+
+    train_metrics = checkpoint.get(
+        "train_metrics",
+        {},
+    )
+
+    validation_metrics = checkpoint.get(
+        "validation_metrics",
+        {},
+    )
+
+    if accelerator.is_main_process:
+        print()
+        print(
+            f"Checkpoint loaded: {path}"
+        )
+
+        print(
+            f"Saved epoch: {start_epoch}"
+        )
+
+        print(
+            f"Best validation PER: "
+            f"{best_validation_per:.2%}"
+        )
+
+        if train_metrics:
+            print(
+                "Saved training metrics:",
+                train_metrics,
+            )
+
+        if validation_metrics:
+            print(
+                "Saved validation metrics:",
+                validation_metrics,
+            )
+
+        if not strict:
+            print(
+                "Missing model keys:",
+                load_result.missing_keys,
+            )
+
+            print(
+                "Unexpected model keys:",
+                load_result.unexpected_keys,
+            )
+
+        if resume_training:
+            print(
+                "Optimizer and scheduler states "
+                "were restored."
+            )
+        else:
+            print(
+                "Only model weights were restored."
+            )
+
+    accelerator.wait_for_everyone()
+
+    return {
+        "start_epoch": start_epoch,
+        "best_validation_per": (
+            best_validation_per
+        ),
+        "train_metrics": train_metrics,
+        "validation_metrics": (
+            validation_metrics
+        ),
+        "checkpoint": checkpoint,
+    }
+
 # %%
-model = ASRModel(
-    wav2vec2_model,
-    SpecAugment(),
-)
+ddp_kwargs = DistributedDataParallelKwargs(find_unused_parameters=True)
+accelerator = Accelerator(mixed_precision="fp16", kwargs_handlers=[ddp_kwargs])
+
+print(f"Using device: {DEVICE}")
+print(f"Num processes: {accelerator.num_processes}")
+
+
+model = ASRModel(wav2vec2_model, SpecAugment())
 
 del wav2vec2_model
 
-checkpoint = torch.load(
-    MODEL_PATH,
-    map_location="cpu",
+
+WARMUP_EPOCHS = 5
+
+WAV2VEC2_LR = 3e-7
+CONFORMER_LR = 3e-6
+SEGMENTATION_LR = 1e-5
+CLASSIFIER_LR = 2e-5
+COUNT_HEAD_LR = 1e-5
+
+
+optimizer = torch.optim.AdamW(
+    [
+        {
+            "params": model.wav2vec2.parameters(),
+            "lr": WAV2VEC2_LR,
+        },
+        {
+            "params": model.conformer.parameters(),
+            "lr": CONFORMER_LR,
+        },
+        {
+            "params": model.segmentation.parameters(),
+            "lr": SEGMENTATION_LR,
+        },
+        {
+            "params": model.segment_classifier.parameters(),
+            "lr": CLASSIFIER_LR,
+        },
+        {
+            "params": model.count_head.parameters(),
+            "lr": COUNT_HEAD_LR,
+        },
+    ],
+    weight_decay=0.01,
 )
 
-load_result = model.load_state_dict(
-    checkpoint["model_state"],
-    strict=False,
+
+# Linear warmup for first WARMUP_EPOCHS, then hand off to ReduceLROnPlateau
+def warmup_lambda(epoch):
+    if epoch < WARMUP_EPOCHS:
+        return (epoch + 1) / WARMUP_EPOCHS  # 0.2, 0.4, 0.6, 0.8, 1.0
+    return 1.0  # after warmup, LR stays at target — plateau scheduler takes over
+
+model, optimizer, train_loader, val_loader = accelerator.prepare(
+    model, optimizer, train_loader, val_loader
 )
 
-print(
-    "Missing keys:",
-    load_result.missing_keys,
+warmup_scheduler = torch.optim.lr_scheduler.LambdaLR(optimizer, lr_lambda=warmup_lambda)
+
+plateau_scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(
+    optimizer,
+    mode="min",
+    factor=0.5,
+    patience=3,
+    min_lr=1e-9,
 )
 
-print(
-    "Unexpected keys:",
-    load_result.unexpected_keys,
-)
 
-invalid_missing_keys = [
-    key
-    for key in load_result.missing_keys
-    if not key.startswith(
-        "count_head."
+best_validation_per = float("inf")
+start_epoch = 0
+
+if os.path.exists(MODEL_PATH):
+    print("Loading checkpoint...")
+    resume_info = load_checkpoint(
+        path=MODEL_PATH,
+        model=model,
+        accelerator=accelerator,
+        optimizer=optimizer,
+        warmup_scheduler=warmup_scheduler,
+        plateau_scheduler=plateau_scheduler,
+        resume_training=True,
+        strict=True,
     )
-]
 
-if invalid_missing_keys:
-    raise RuntimeError(
-        f"Unexpected missing keys: "
-        f"{invalid_missing_keys}"
-    )
+    start_epoch = resume_info[
+        "start_epoch"
+    ]
 
-if load_result.unexpected_keys:
-    raise RuntimeError(
-        f"Unexpected checkpoint keys: "
-        f"{load_result.unexpected_keys}"
-    )
+    best_validation_per = resume_info[
+        "best_validation_per"
+    ]
 
-for parameter in model.parameters():
-    parameter.requires_grad = False
-
-for parameter in (
-    model.count_head.parameters()
-):
-    parameter.requires_grad = True
-
-trainable_parameters = [
-    name
-    for name, parameter
-    in model.named_parameters()
-    if parameter.requires_grad
-]
-
-print(
-    "Trainable parameters:"
-)
-
-for name in trainable_parameters:
-    print(name)
-
-count_optimizer = torch.optim.AdamW(
-    model.count_head.parameters(),
-    lr=1e-3,
-    weight_decay=1e-4,
-)
-
-accelerator = Accelerator(
-    mixed_precision="fp16"
-)
-
-
-(
-    model,
-    count_optimizer,
-    train_loader,
-    val_loader,
-) = accelerator.prepare(
-    model,
-    count_optimizer,
-    train_loader,
-    val_loader,
-)
-
-
+    print("done loading")
+else:
+    print("Starting fresh training")
+    best_validation_per = float("inf")
+    start_epoch = 0
 
 # %%
-def train_count_head(
+def segmentation_loss(
+    logits_batch,
+    targets,
+    target_lengths,
+):
+    all_logits = []
+    all_targets = []
+
+    for batch_index, logits in enumerate(
+        logits_batch
+    ):
+        target_length = int(
+            target_lengths[
+                batch_index
+            ].item()
+        )
+
+        target = targets[
+            batch_index,
+            :target_length,
+        ].long().to(
+            logits.device
+        )
+
+        all_logits.append(logits)
+        all_targets.append(target)
+
+    all_logits = torch.cat(
+        all_logits,
+        dim=0,
+    )
+
+    all_targets = torch.cat(
+        all_targets,
+        dim=0,
+    )
+
+    return F.cross_entropy(
+        all_logits,
+        all_targets,
+    )
+
+# %%
+model
+
+# %%
+def levenshtein_counts(
+    reference,
+    hypothesis,
+):
+    reference = list(reference)
+    hypothesis = list(hypothesis)
+
+    reference_length = len(reference)
+    hypothesis_length = len(hypothesis)
+
+    costs = [
+        [0] * (hypothesis_length + 1)
+        for _ in range(
+            reference_length + 1
+        )
+    ]
+
+    operations = [
+        [None] * (hypothesis_length + 1)
+        for _ in range(
+            reference_length + 1
+        )
+    ]
+
+    for reference_index in range(
+        1,
+        reference_length + 1,
+    ):
+        costs[reference_index][0] = (
+            reference_index
+        )
+
+        operations[
+            reference_index
+        ][0] = "delete"
+
+    for hypothesis_index in range(
+        1,
+        hypothesis_length + 1,
+    ):
+        costs[0][hypothesis_index] = (
+            hypothesis_index
+        )
+
+        operations[0][
+            hypothesis_index
+        ] = "insert"
+
+    for reference_index in range(
+        1,
+        reference_length + 1,
+    ):
+        for hypothesis_index in range(
+            1,
+            hypothesis_length + 1,
+        ):
+            reference_token = reference[
+                reference_index - 1
+            ]
+
+            hypothesis_token = hypothesis[
+                hypothesis_index - 1
+            ]
+
+            if (
+                reference_token
+                == hypothesis_token
+            ):
+                costs[
+                    reference_index
+                ][
+                    hypothesis_index
+                ] = costs[
+                    reference_index - 1
+                ][
+                    hypothesis_index - 1
+                ]
+
+                operations[
+                    reference_index
+                ][
+                    hypothesis_index
+                ] = "match"
+
+                continue
+
+            substitution_cost = (
+                costs[
+                    reference_index - 1
+                ][
+                    hypothesis_index - 1
+                ]
+                + 1
+            )
+
+            deletion_cost = (
+                costs[
+                    reference_index - 1
+                ][
+                    hypothesis_index
+                ]
+                + 1
+            )
+
+            insertion_cost = (
+                costs[
+                    reference_index
+                ][
+                    hypothesis_index - 1
+                ]
+                + 1
+            )
+
+            minimum_cost = min(
+                substitution_cost,
+                deletion_cost,
+                insertion_cost,
+            )
+
+            costs[
+                reference_index
+            ][
+                hypothesis_index
+            ] = minimum_cost
+
+            if (
+                minimum_cost
+                == substitution_cost
+            ):
+                operations[
+                    reference_index
+                ][
+                    hypothesis_index
+                ] = "substitute"
+
+            elif (
+                minimum_cost
+                == deletion_cost
+            ):
+                operations[
+                    reference_index
+                ][
+                    hypothesis_index
+                ] = "delete"
+
+            else:
+                operations[
+                    reference_index
+                ][
+                    hypothesis_index
+                ] = "insert"
+
+    substitutions = 0
+    deletions = 0
+    insertions = 0
+    matches = 0
+
+    reference_index = reference_length
+    hypothesis_index = hypothesis_length
+
+    while (
+        reference_index > 0
+        or hypothesis_index > 0
+    ):
+        operation = operations[
+            reference_index
+        ][
+            hypothesis_index
+        ]
+
+        if operation == "match":
+            matches += 1
+            reference_index -= 1
+            hypothesis_index -= 1
+
+        elif operation == "substitute":
+            substitutions += 1
+            reference_index -= 1
+            hypothesis_index -= 1
+
+        elif operation == "delete":
+            deletions += 1
+            reference_index -= 1
+
+        elif operation == "insert":
+            insertions += 1
+            hypothesis_index -= 1
+
+        else:
+            raise RuntimeError(
+                "Invalid Levenshtein "
+                f"operation at "
+                f"({reference_index}, "
+                f"{hypothesis_index})"
+            )
+
+    return {
+        "substitutions": substitutions,
+        "deletions": deletions,
+        "insertions": insertions,
+        "matches": matches,
+    }
+
+# %%
+@torch.inference_mode()
+def evaluate_model(
+    model,
+    val_loader,
+    accelerator,
+):
+    model.eval()
+
+    total_substitutions = 0
+    total_deletions = 0
+    total_insertions = 0
+    total_matches = 0
+
+    total_reference_phonemes = 0
+    total_predicted_phonemes = 0
+
+    exact_sequences = 0
+    total_sequences = 0
+
+    progress_bar = tqdm(
+        val_loader,
+        desc="Real validation",
+        disable=(
+            not accelerator
+            .is_local_main_process
+        ),
+    )
+
+    for (
+        waveforms,
+        targets,
+        input_lengths,
+        target_lengths,
+    ) in progress_bar:
+
+        # No target_lengths are passed here.
+        with accelerator.autocast():
+            (
+                logits_batch,
+                segment_lengths,
+                hard_boundaries_batch,
+                hidden_lengths,
+                predicted_counts,
+                predicted_lengths,
+            ) = model(
+                waveforms,
+                input_lengths,
+            )
+
+        for batch_index, logits in enumerate(
+            logits_batch
+        ):
+            predicted_ids = torch.argmax(
+                logits,
+                dim=-1,
+            )
+
+            predicted_ids = (
+                predicted_ids
+                .detach()
+                .cpu()
+                .tolist()
+            )
+
+            # Used only to remove padding from
+            # the reference sequence.
+            reference_length = int(
+                target_lengths[
+                    batch_index
+                ].item()
+            )
+
+            reference_ids = (
+                targets[
+                    batch_index,
+                    :reference_length,
+                ]
+                .detach()
+                .cpu()
+                .tolist()
+            )
+
+            alignment = levenshtein_counts(
+                reference=reference_ids,
+                hypothesis=predicted_ids,
+            )
+
+            substitutions = alignment[
+                "substitutions"
+            ]
+
+            deletions = alignment[
+                "deletions"
+            ]
+
+            insertions = alignment[
+                "insertions"
+            ]
+
+            matches = alignment[
+                "matches"
+            ]
+
+            total_substitutions += (
+                substitutions
+            )
+
+            total_deletions += deletions
+            total_insertions += insertions
+            total_matches += matches
+
+            total_reference_phonemes += (
+                len(reference_ids)
+            )
+
+            total_predicted_phonemes += (
+                len(predicted_ids)
+            )
+
+            edit_distance = (
+                substitutions
+                + deletions
+                + insertions
+            )
+
+            exact_sequences += int(
+                edit_distance == 0
+            )
+
+            total_sequences += 1
+
+    statistics = torch.tensor(
+        [
+            total_substitutions,
+            total_deletions,
+            total_insertions,
+            total_matches,
+            total_reference_phonemes,
+            total_predicted_phonemes,
+            exact_sequences,
+            total_sequences,
+        ],
+        dtype=torch.float64,
+        device=accelerator.device,
+    )
+
+    statistics = accelerator.reduce(
+        statistics,
+        reduction="sum",
+    )
+
+    substitutions = int(
+        statistics[0].item()
+    )
+
+    deletions = int(
+        statistics[1].item()
+    )
+
+    insertions = int(
+        statistics[2].item()
+    )
+
+    matches = int(
+        statistics[3].item()
+    )
+
+    reference_phoneme_count = max(
+        int(
+            statistics[4].item()
+        ),
+        1,
+    )
+
+    predicted_phoneme_count = int(
+        statistics[5].item()
+    )
+
+    exact_sequence_count = int(
+        statistics[6].item()
+    )
+
+    sequence_count = max(
+        int(
+            statistics[7].item()
+        ),
+        1,
+    )
+
+    total_errors = (
+        substitutions
+        + deletions
+        + insertions
+    )
+
+    phoneme_error_rate = (
+        total_errors
+        / reference_phoneme_count
+    )
+
+    # Fraction of reference phonemes that were
+    # correctly matched after alignment.
+    aligned_match_rate = (
+        matches
+        / reference_phoneme_count
+    )
+
+    exact_sequence_accuracy = (
+        exact_sequence_count
+        / sequence_count
+    )
+
+    return {
+        "phoneme_error_rate": (
+            phoneme_error_rate
+        ),
+        "aligned_match_rate": (
+            aligned_match_rate
+        ),
+        "exact_sequence_accuracy": (
+            exact_sequence_accuracy
+        ),
+        "substitutions": substitutions,
+        "deletions": deletions,
+        "insertions": insertions,
+        "matches": matches,
+        "total_errors": total_errors,
+        "reference_phonemes": (
+            reference_phoneme_count
+        ),
+        "predicted_phonemes": (
+            predicted_phoneme_count
+        ),
+        "sequence_count": sequence_count,
+    }
+
+# %%
+def train_model(
     model,
     train_loader,
     val_loader,
     optimizer,
+    warmup_scheduler,
+    plateau_scheduler,
     accelerator,
-    checkpoint_path,
-    epochs=20,
-    patience=5,
+    epochs=5,
+    warmup_epochs=2,
+    count_loss_weight=0.1,
+    best_validation_per= float("inf"),
+    working_model_path = WORKING_MODEL_PATH,
+    working_best_model_path = WORKING_BEST_MODEL_PATH,
 ):
-    best_val_mae = float("inf")
-    epochs_without_improvement = 0
+    """
+    Full-model fine-tuning.
+
+    Training:
+        - true target length for segmentation
+        - phoneme cross-entropy
+        - small count-head loss
+
+    Validation:
+        - no target length passed to model
+        - PER, S/D/I and exact sequence accuracy
+
+    Best model:
+        - lowest end-to-end PER
+    """
+
 
     for epoch in range(epochs):
-        model.eval()
 
-        accelerator.unwrap_model(
-            model
-        ).count_head.train()
+        # ==========================================================
+        # Training
+        # ==========================================================
 
-        train_loss_sum = 0.0
-        train_absolute_error_sum = 0.0
+        model.train()
+
+        train_phoneme_loss_sum = 0.0
+        train_count_loss_sum = 0.0
+
+        train_correct_phonemes = 0
+        train_phoneme_count = 0
         train_sample_count = 0
 
         train_progress = tqdm(
             train_loader,
             desc=(
-                f"Count training "
+                f"Fine-tuning "
                 f"{epoch + 1}/{epochs}"
             ),
             disable=(
@@ -1206,42 +1918,52 @@ def train_count_head(
             input_lengths,
             target_lengths,
         ) in train_progress:
+
             optimizer.zero_grad(
                 set_to_none=True
             )
 
-            (
-                predicted_counts,
-                hidden_lengths,
-            ) = model(
-                waveforms,
-                input_lengths,
-                count_only=True,
-            )
-
-            target_counts = (
-                target_lengths.float()
-            )
-
-            batch_loss_sum = (
-                F.smooth_l1_loss(
+            with accelerator.autocast():
+                (
+                    logits_batch,
+                    segment_lengths,
+                    hard_boundaries_batch,
+                    hidden_lengths,
                     predicted_counts,
-                    target_counts,
-                    reduction="sum",
+                ) = model(
+                    waveforms,
+                    input_lengths,
+                    target_lengths=(
+                        target_lengths
+                    ),
+                    return_count=True,
                 )
-            )
 
-            batch_size = (
-                target_counts.numel()
-            )
+                phoneme_loss = segmentation_loss(
+                    logits_batch=(
+                        logits_batch
+                    ),
+                    targets=targets,
+                    target_lengths=(
+                        target_lengths
+                    ),
+                )
 
-            loss = (
-                batch_loss_sum
-                / batch_size
-            )
+                count_loss = (
+                    F.smooth_l1_loss(
+                        predicted_counts.float(),
+                        target_lengths.float(),
+                    )
+                )
+
+                total_loss = (
+                    phoneme_loss
+                    + count_loss_weight
+                    * count_loss
+                )
 
             accelerator.backward(
-                loss
+                total_loss
             )
 
             if accelerator.sync_gradients:
@@ -1252,1188 +1974,389 @@ def train_count_head(
 
             optimizer.step()
 
-            with torch.no_grad():
-                absolute_errors = torch.abs(
-                    predicted_counts
-                    - target_counts
-                )
-
-            train_loss_sum += float(
-                batch_loss_sum
-                .detach()
-                .item()
+            batch_phoneme_count = int(
+                target_lengths.sum().item()
             )
 
-            train_absolute_error_sum += float(
-                absolute_errors
-                .sum()
-                .item()
+            batch_sample_count = int(
+                target_lengths.numel()
+            )
+
+            train_phoneme_loss_sum += (
+                float(
+                    phoneme_loss
+                    .detach()
+                    .item()
+                )
+                * batch_phoneme_count
+            )
+
+            train_count_loss_sum += (
+                float(
+                    count_loss
+                    .detach()
+                    .item()
+                )
+                * batch_sample_count
+            )
+
+            train_phoneme_count += (
+                batch_phoneme_count
             )
 
             train_sample_count += (
-                batch_size
+                batch_sample_count
             )
+
+            for batch_index, logits in enumerate(
+                logits_batch
+            ):
+                target_length = int(
+                    target_lengths[
+                        batch_index
+                    ].item()
+                )
+
+                predictions = torch.argmax(
+                    logits,
+                    dim=-1,
+                )
+
+                target = targets[
+                    batch_index,
+                    :target_length,
+                ].to(
+                    predictions.device
+                )
+
+                train_correct_phonemes += int(
+                    (
+                        predictions == target
+                    )
+                    .sum()
+                    .item()
+                )
 
             train_progress.set_postfix(
-                loss=(
-                    f"{loss.item():.4f}"
-                )
+                total=(
+                    f"{total_loss.detach().item():.4f}"
+                ),
+                phoneme=(
+                    f"{phoneme_loss.detach().item():.4f}"
+                ),
+                count=(
+                    f"{count_loss.detach().item():.4f}"
+                ),
             )
 
-        train_stats = torch.tensor(
+        # ==========================================================
+        # Reduce training statistics across processes
+        # ==========================================================
+
+        train_statistics = torch.tensor(
             [
-                train_loss_sum,
-                train_absolute_error_sum,
+                train_phoneme_loss_sum,
+                train_count_loss_sum,
+                train_correct_phonemes,
+                train_phoneme_count,
                 train_sample_count,
             ],
             dtype=torch.float64,
             device=accelerator.device,
         )
 
-        train_stats = accelerator.reduce(
-            train_stats,
+        train_statistics = accelerator.reduce(
+            train_statistics,
             reduction="sum",
         )
 
-        global_train_loss = (
-            train_stats[0].item()
-            / max(
-                train_stats[2].item(),
-                1,
-            )
-        )
-
-        global_train_mae = (
-            train_stats[1].item()
-            / max(
-                train_stats[2].item(),
-                1,
-            )
-        )
-
-        model.eval()
-
-        val_loss_sum = 0.0
-        val_absolute_error_sum = 0.0
-        val_rounded_error_sum = 0.0
-        val_bias_sum = 0.0
-        val_exact_count = 0
-        val_within_one_count = 0
-        val_within_two_count = 0
-        val_sample_count = 0
-
-        val_progress = tqdm(
-            val_loader,
-            desc=(
-                f"Count validation "
-                f"{epoch + 1}/{epochs}"
-            ),
-            disable=(
-                not accelerator
-                .is_local_main_process
-            ),
-        )
-
-        with torch.no_grad():
-            for (
-                waveforms,
-                targets,
-                input_lengths,
-                target_lengths,
-            ) in val_progress:
-                (
-                    predicted_counts,
-                    hidden_lengths,
-                ) = model(
-                    waveforms,
-                    input_lengths,
-                    count_only=True,
-                )
-
-                target_counts = (
-                    target_lengths.float()
-                )
-
-                batch_loss_sum = (
-                    F.smooth_l1_loss(
-                        predicted_counts,
-                        target_counts,
-                        reduction="sum",
-                    )
-                )
-
-                rounded_counts = torch.round(
-                    predicted_counts
-                ).long()
-
-                rounded_counts = torch.clamp(
-                    rounded_counts,
-                    min=1,
-                )
-
-                rounded_counts = torch.minimum(
-                    rounded_counts,
-                    hidden_lengths.long(),
-                )
-
-                count_errors = (
-                    rounded_counts
-                    - target_lengths.long()
-                )
-
-                absolute_errors = torch.abs(
-                    predicted_counts
-                    - target_counts
-                )
-
-                rounded_absolute_errors = (
-                    torch.abs(
-                        count_errors
-                    )
-                )
-
-                batch_size = (
-                    target_counts.numel()
-                )
-
-                val_loss_sum += float(
-                    batch_loss_sum.item()
-                )
-
-                val_absolute_error_sum += float(
-                    absolute_errors
-                    .sum()
-                    .item()
-                )
-
-                val_rounded_error_sum += float(
-                    rounded_absolute_errors
-                    .sum()
-                    .item()
-                )
-
-                val_bias_sum += float(
-                    (
-                        predicted_counts
-                        - target_counts
-                    )
-                    .sum()
-                    .item()
-                )
-
-                val_exact_count += int(
-                    (
-                        rounded_absolute_errors
-                        == 0
-                    )
-                    .sum()
-                    .item()
-                )
-
-                val_within_one_count += int(
-                    (
-                        rounded_absolute_errors
-                        <= 1
-                    )
-                    .sum()
-                    .item()
-                )
-
-                val_within_two_count += int(
-                    (
-                        rounded_absolute_errors
-                        <= 2
-                    )
-                    .sum()
-                    .item()
-                )
-
-                val_sample_count += (
-                    batch_size
-                )
-
-        val_stats = torch.tensor(
-            [
-                val_loss_sum,
-                val_absolute_error_sum,
-                val_rounded_error_sum,
-                val_bias_sum,
-                val_exact_count,
-                val_within_one_count,
-                val_within_two_count,
-                val_sample_count,
-            ],
-            dtype=torch.float64,
-            device=accelerator.device,
-        )
-
-        val_stats = accelerator.reduce(
-            val_stats,
-            reduction="sum",
-        )
-
-        total_samples = max(
+        global_train_phoneme_count = max(
             int(
-                val_stats[7].item()
+                train_statistics[3].item()
             ),
             1,
         )
 
-        avg_val_loss = (
-            val_stats[0].item()
-            / total_samples
+        global_train_sample_count = max(
+            int(
+                train_statistics[4].item()
+            ),
+            1,
         )
 
-        val_mae = (
-            val_stats[1].item()
-            / total_samples
+        average_train_phoneme_loss = (
+            train_statistics[0].item()
+            / global_train_phoneme_count
         )
 
-        val_rounded_mae = (
-            val_stats[2].item()
-            / total_samples
+        average_train_count_loss = (
+            train_statistics[1].item()
+            / global_train_sample_count
         )
 
-        val_bias = (
-            val_stats[3].item()
-            / total_samples
+        train_accuracy = (
+            train_statistics[2].item()
+            / global_train_phoneme_count
         )
 
-        exact_accuracy = (
-            val_stats[4].item()
-            / total_samples
+        average_train_total_loss = (
+            average_train_phoneme_loss
+            + count_loss_weight
+            * average_train_count_loss
         )
 
-        within_one_accuracy = (
-            val_stats[5].item()
-            / total_samples
+        train_metrics = {
+            "total_loss": (
+                average_train_total_loss
+            ),
+            "phoneme_loss": (
+                average_train_phoneme_loss
+            ),
+            "count_loss": (
+                average_train_count_loss
+            ),
+            "phoneme_accuracy": (
+                train_accuracy
+            ),
+        }
+
+        # ==========================================================
+        # Real validation
+        # ==========================================================
+
+        validation_metrics = evaluate_model(
+            model=model,
+            val_loader=val_loader,
+            accelerator=accelerator,
         )
 
-        within_two_accuracy = (
-            val_stats[6].item()
-            / total_samples
+        validation_per = (
+            validation_metrics[
+                "phoneme_error_rate"
+            ]
         )
 
-        if accelerator.is_main_process:
-            print()
-            print(
-                f"Epoch {epoch + 1}/{epochs}"
+        # ==========================================================
+        # Scheduler
+        # ==========================================================
+
+        if epoch < warmup_epochs:
+            warmup_scheduler.step()
+            active_scheduler = "warmup"
+
+        else:
+            plateau_scheduler.step(
+                validation_per
             )
-            print(
-                f"Train count loss : "
-                f"{global_train_loss:.4f}"
-            )
-            print(
-                f"Train count MAE  : "
-                f"{global_train_mae:.3f}"
-            )
-            print(
-                f"Val count loss   : "
-                f"{avg_val_loss:.4f}"
-            )
-            print(
-                f"Val raw MAE      : "
-                f"{val_mae:.3f}"
-            )
-            print(
-                f"Val rounded MAE  : "
-                f"{val_rounded_mae:.3f}"
-            )
-            print(
-                f"Val bias         : "
-                f"{val_bias:+.3f}"
-            )
-            print(
-                f"Exact count      : "
-                f"{exact_accuracy:.2%}"
-            )
-            print(
-                f"Within ±1        : "
-                f"{within_one_accuracy:.2%}"
-            )
-            print(
-                f"Within ±2        : "
-                f"{within_two_accuracy:.2%}"
-            )
+
+            active_scheduler = "plateau"
+
+        # ==========================================================
+        # Best-model selection
+        # ==========================================================
 
         improved = (
-            val_mae < best_val_mae
+            validation_per
+            < best_validation_per
         )
 
         if improved:
-            best_val_mae = val_mae
-            epochs_without_improvement = 0
+            best_validation_per = (
+                validation_per
+            )
 
-            if accelerator.is_main_process:
-                unwrapped_model = (
-                    accelerator
-                    .unwrap_model(model)
-                )
+        # ==========================================================
+        # Print training progress
+        # ==========================================================
 
-                torch.save(
-                    {
-                        "model_state": (
-                            unwrapped_model
-                            .state_dict()
-                        ),
-                        "optimizer_state": (
-                            optimizer
-                            .state_dict()
-                        ),
-                        "epoch": epoch,
-                        "best_val_mae": (
-                            best_val_mae
-                        ),
-                        "val_exact_accuracy": (
-                            exact_accuracy
-                        ),
-                        "val_within_one": (
-                            within_one_accuracy
-                        ),
-                        "val_within_two": (
-                            within_two_accuracy
-                        ),
-                    },
-                    checkpoint_path,
-                )
+        if accelerator.is_main_process:
+            print()
+            print("=" * 78)
+
+            print(
+                f"Epoch {epoch + 1}/{epochs}"
+            )
+
+            print()
+            print("Training")
+
+            print(
+                f"Total loss          : "
+                f"{average_train_total_loss:.4f}"
+            )
+
+            print(
+                f"Phoneme loss        : "
+                f"{average_train_phoneme_loss:.4f}"
+            )
+
+            print(
+                f"Count loss          : "
+                f"{average_train_count_loss:.4f}"
+            )
+
+            print(
+                f"Phoneme accuracy    : "
+                f"{train_accuracy:.2%}"
+            )
+
+            print()
+            print(
+                "Real end-to-end validation"
+            )
+
+            print(
+                f"Phoneme error rate  : "
+                f"{validation_per:.2%}"
+            )
+
+            print(
+                f"Aligned match rate  : "
+                f"{validation_metrics['aligned_match_rate']:.2%}"
+            )
+
+            print(
+                f"Exact sequences     : "
+                f"{validation_metrics['exact_sequence_accuracy']:.2%}"
+            )
+
+            print(
+                f"Substitutions       : "
+                f"{validation_metrics['substitutions']}"
+            )
+
+            print(
+                f"Deletions           : "
+                f"{validation_metrics['deletions']}"
+            )
+
+            print(
+                f"Insertions          : "
+                f"{validation_metrics['insertions']}"
+            )
+
+            print(
+                f"Reference phonemes  : "
+                f"{validation_metrics['reference_phonemes']}"
+            )
+
+            print(
+                f"Predicted phonemes  : "
+                f"{validation_metrics['predicted_phonemes']}"
+            )
+
+            print(
+                f"Best validation PER : "
+                f"{best_validation_per:.2%}"
+            )
+
+            print(
+                f"Scheduler           : "
+                f"{active_scheduler}"
+            )
+
+            print()
+            print("Learning rates")
+
+            module_names = [
+                "Wav2Vec2",
+                "Conformer",
+                "Segmentation",
+                "Classifier",
+                "Count head",
+            ]
+
+            for group_index, group in enumerate(
+                optimizer.param_groups
+            ):
+                if (
+                    group_index
+                    < len(module_names)
+                ):
+                    group_name = (
+                        module_names[
+                            group_index
+                        ]
+                    )
+                else:
+                    group_name = (
+                        f"Group {group_index}"
+                    )
 
                 print(
-                    "Best count model saved"
+                    f"{group_name:<14}: "
+                    f"{group['lr']:.8g}"
                 )
-        else:
-            epochs_without_improvement += 1
+
+            print("=" * 78)
+            print()
+
+        # ==========================================================
+        # Save checkpoints
+        # ==========================================================
 
         accelerator.wait_for_everyone()
 
-        if (
-            epochs_without_improvement
-            >= patience
-        ):
-            if accelerator.is_main_process:
-                print(
-                    "Count training stopped "
-                    "early"
+        if accelerator.is_main_process:
+
+            save_checkpoint(
+                model=model,
+                optimizer=optimizer,
+                warmup_scheduler=(
+                    warmup_scheduler
+                ),
+                plateau_scheduler=(
+                    plateau_scheduler
+                ),
+                accelerator=accelerator,
+                epoch=epoch,
+                train_metrics=train_metrics,
+                validation_metrics=(
+                    validation_metrics
+                ),
+                best_validation_per=(
+                    best_validation_per
+                ),
+                path=working_model_path,
+            )
+
+            if improved:
+                save_checkpoint(
+                    model=model,
+                    optimizer=optimizer,
+                    warmup_scheduler=(
+                        warmup_scheduler
+                    ),
+                    plateau_scheduler=(
+                        plateau_scheduler
+                    ),
+                    accelerator=accelerator,
+                    epoch=epoch,
+                    train_metrics=(
+                        train_metrics
+                    ),
+                    validation_metrics=(
+                        validation_metrics
+                    ),
+                    best_validation_per=(
+                        best_validation_per
+                    ),
+                    path=working_best_model_path,
                 )
 
-            break
+                print(
+                    "Best fine-tuned model saved"
+                )
 
-    return best_val_mae
+        accelerator.wait_for_everyone()
 
-# %%
-best_count_mae = train_count_head(
-    model=model,
-    train_loader=train_loader,
-    val_loader=val_loader,
-    optimizer=count_optimizer,
-    accelerator=accelerator,
-    checkpoint_path=COUNT_MODEL_PATH,
-    epochs=20,
-    patience=5,
-)
-
-# %%
-count_checkpoint = torch.load(
-    MODEL_PATH,
-    map_location="cpu",
-)
-
-accelerator.unwrap_model(
-    model
-).load_state_dict(
-    count_checkpoint[
-        "model_state"
-    ]
-)
-
-model.eval()
-
-# %%
-batch = next(
-    iter(val_loader)
-)
-
-(
-    waveforms,
-    targets,
-    input_lengths,
-    target_lengths,
-) = batch
-
-with torch.no_grad():
-    (
-        logits_batch,
-        segment_lengths,
-        hard_boundaries_batch,
-        hidden_lengths,
-        predicted_counts,
-        predicted_lengths,
-    ) = model(
-        waveforms,
-        input_lengths,
-    )
-
-print(
-    "True lengths:",
-    target_lengths.detach().cpu().tolist(),
-)
-
-print(
-    "Raw predicted counts:",
-    predicted_counts.detach().cpu().tolist(),
-)
-
-print(
-    "Rounded predicted lengths:",
-    predicted_lengths.detach().cpu().tolist(),
-)
-
-for batch_index, logits in enumerate(
-    logits_batch
-):
-    predicted_phonemes = [
-        id_to_phoneme[
-            int(token_id)
-        ]
-        for token_id in torch.argmax(
-            logits,
-            dim=-1,
-        )
-        .detach()
-        .cpu()
-        .tolist()
-    ]
-
-    print()
-    print(
-        f"Sample {batch_index}"
-    )
-    print(
-        "Predicted phonemes:",
-        predicted_phonemes,
-    )
-
-# %%
-# ddp_kwargs = DistributedDataParallelKwargs(find_unused_parameters=True)
-# accelerator = Accelerator(mixed_precision="fp16", kwargs_handlers=[ddp_kwargs])
-
-# print(f"Using device: {DEVICE}")
-# print(f"Num processes: {accelerator.num_processes}")
-
-
-# model = ASRModel(wav2vec2_model, SpecAugment())
-
-# del wav2vec2_model
-
-
-# WARMUP_EPOCHS = 5
-# WAV2VEC2_LR = 1e-6
-# CONFORMER_LR = 1e-4
-# SEGMENTATION_LR = 2e-4
-# CLASSIFIER_LR = 3e-4
-
-# optimizer = torch.optim.AdamW(
-#     [
-#         {
-#             "params": model.wav2vec2.parameters(),
-#             "lr": WAV2VEC2_LR,
-#         },
-#         {
-#             "params": model.conformer.parameters(),
-#             "lr": CONFORMER_LR,
-#         },
-#         {
-#             "params": model.segmentation.parameters(),
-#             "lr": SEGMENTATION_LR,
-#         },
-#         {
-#             "params": model.segment_classifier.parameters(),
-#             "lr": CLASSIFIER_LR,
-#         },
-#     ],
-#     weight_decay=0.01,
-# )
-
-
-# # Linear warmup for first WARMUP_EPOCHS, then hand off to ReduceLROnPlateau
-# def warmup_lambda(epoch):
-#     if epoch < WARMUP_EPOCHS:
-#         return (epoch + 1) / WARMUP_EPOCHS  # 0.2, 0.4, 0.6, 0.8, 1.0
-#     return 1.0  # after warmup, LR stays at target — plateau scheduler takes over
-
-
-# warmup_scheduler = torch.optim.lr_scheduler.LambdaLR(optimizer, lr_lambda=warmup_lambda)
-
-# plateau_scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(
-#     optimizer,
-#     mode="min",
-#     factor=0.5,
-#     patience=3,
-#     min_lr=1e-9,
-# )
-
-# model, optimizer, train_loader, val_loader = accelerator.prepare(
-#     model, optimizer, train_loader, val_loader
-# )
-
-
-# best_val_loss = float("inf")
-# epochs_no_improve = 0
-# start_epoch = 0
-
-# if os.path.exists(MODEL_PATH):
-#     print("Loading checkpoint...")
-#     ckpt = torch.load(MODEL_PATH, map_location=DEVICE)
-#     accelerator.unwrap_model(model).load_state_dict(ckpt["model_state"])
-
-#     optimizer.load_state_dict(ckpt["optimizer_state"])
-
-#     # Safe load — handles both old and new checkpoint formats
-#     if "warmup_scheduler_state" in ckpt:
-#         warmup_scheduler.load_state_dict(ckpt["warmup_scheduler_state"])
-#         print("Warmup scheduler state restored ✅")
-#     else:
-#         print("⚠️ No warmup scheduler state found — starting fresh (old checkpoint)")
-
-#     if "plateau_scheduler_state" in ckpt:
-#         plateau_scheduler.load_state_dict(ckpt["plateau_scheduler_state"])
-#         print("Plateau scheduler state restored ✅")
-#     elif "scheduler_state" in ckpt:
-#         # Old checkpoint had a single scheduler — load into plateau scheduler
-#         plateau_scheduler.load_state_dict(ckpt["scheduler_state"])
-#         print("Plateau scheduler restored from old checkpoint format ✅")
-#     else:
-#         print("⚠️ No plateau scheduler state found — starting fresh")
-
-#     best_val_loss = ckpt["best_val_loss"]
-#     epochs_no_improve = ckpt["epochs_no_improve"]
-#     start_epoch = ckpt["epoch"] + 1
-#     print(f"Resumed from epoch {start_epoch}")
-#     print(f"Best val loss so far: {best_val_loss:.4f}")
-#     print("done loading")
-# else:
-#     print("Starting fresh training")
-#     best_val_loss = float("inf")
-#     epochs_no_improve = 0
-#     start_epoch = 0
-
-# %%
-# def segmentation_loss(
-#     logits_batch,
-#     targets,
-#     target_lengths,
-# ):
-#     all_logits = []
-#     all_targets = []
-
-#     for b, logits in enumerate(logits_batch):
-#         N = int(target_lengths[b].item())
-
-#         target = targets[b, :N].long()
-#         target = target.to(logits.device)
-
-#         all_logits.append(logits)
-#         all_targets.append(target)
-
-#     all_logits = torch.cat(all_logits, dim=0)
-#     all_targets = torch.cat(all_targets, dim=0)
-
-#     return F.cross_entropy(
-#         all_logits,
-#         all_targets,
-#     )
-
-# %%
-# import gc
-
-# model_wights = torch.load("best_model.pth",weights_only=False)
-
-# model.load_state_dict(model_wights)
-
-# print(gc.collect())
-
-
-# for waveforms, targets, input_lengths, target_lengths in tqdm(train_loader):
-
-#     print("*" * 40)
-#     print("Waveforms shape:", waveforms.shape)
-
-#     audio_path = (
-#         f"../../datasets/Quran_ds/Quran_ds/audio/audio/{train_df.iloc[1]['path_of_audio']}"
-#     )
-    
-#     # waveforms, sr = torchaudio.load(audio_path)
-#     # input_lengths = torch.tensor([waveforms.shape[1]], dtype=torch.long, device=DEVICE)
-
-#     # target_lengths = torch.tensor(
-#     #     [len(ast.literal_eval(train_df.iloc[1]["phonemes"]))], dtype=torch.long
-#     # ).to(DEVICE)
-
-#     # targets = torch.tensor(
-#     #     [[phoneme_to_id[p] for p in ast.literal_eval(train_df.iloc[1]["phonemes"])]],
-#     #     dtype=torch.long,
-#     # ).to(DEVICE)
-
-#     # target_lengths = torch.tensor([targets.shape[1]], dtype=torch.long).to(DEVICE)
-
-
-#     logits_batch, segment_lengths, hidden_lengths = model(
-#         waveforms.to(DEVICE), input_lengths, target_lengths
-#     )
-
-
-#     print("Waveforms:", waveforms.shape)
-#     print("Input lengths:", input_lengths)
-#     print("target_lengths:", target_lengths)
-#     print("Targets shape:", targets.shape)
-#     print("Targets:", targets)
-#     print()
-#     print("hidden_lengths  :", hidden_lengths)
-#     print("Logits:", logits_batch[0].shape)
-#     print("Segment lengths:", segment_lengths[0].shape)
-
-#     print("***" * 40)
-
-#     total_frames = sum([sl.sum().item() for sl in segment_lengths])
-
-#     print(f"Total frames assigned: {total_frames}")
-
-#     model_output = [
-#         (pred, segment_lengths[0][i].item())
-#         for i, pred in enumerate(
-#             [
-#                 id_to_phoneme[p.item()]
-#                 for p in torch.stack(
-#                     [torch.argmax(logits, dim=-1).cpu() for logits in logits_batch[0]]
-#                 )
-#             ]
-#         )
-#     ]
-
-#     print("preds", model_output)
-
-#     if targets.dim() == 1:
-#         targets_batch = targets.unsqueeze(0)
-#     else:
-#         targets_batch = targets
-
-#     loss = segmentation_loss(
-#         logits_batch=logits_batch,
-#         targets=targets_batch,
-#         target_lengths=target_lengths,
-#         segment_lengths=segment_lengths,
-#         hidden_lengths=hidden_lengths,
-#     )
-
-#     print("Loss:", loss.item())
-
-# loss.backward()
-
-# print("Backward OK")
-
-# %%
-model
+    return best_validation_per
 
 # %%
 print("training is starting .......")
 
 # %%
-# def train_model(
-#     model,
-#     train_loader,
-#     val_loader,
-#     optimizer,
-#     warmup_scheduler,
-#     plateau_scheduler,
-#     accelerator,
-#     epochs=30,
-#     patience=6,
-#     best_val_loss=float("inf"),
-#     epochs_no_improve=0,
-#     start_epoch=0,
-#     warmup_epochs=WARMUP_EPOCHS,
-#     print_boundaries_every=1,
-# ):
-#     end_epoch = start_epoch + epochs
-
-#     for epoch in range(start_epoch, end_epoch):
-
-#         model.train()
-
-#         train_loss_sum = 0.0
-#         train_segment_count = 0
-
-#         train_progress = tqdm(
-#             train_loader,
-#             desc=f"Training epoch {epoch + 1}",
-#             disable=not accelerator.is_local_main_process,
-#         )
-
-#         for (
-#             waveforms,
-#             targets,
-#             input_lengths,
-#             target_lengths,
-#         ) in train_progress:
-
-#             optimizer.zero_grad(set_to_none=True)
-
-#             (
-#                 logits_batch,
-#                 segment_lengths,
-#                 hard_boundaries_batch,
-#                 hidden_lengths,
-#             ) = model(
-#                 waveforms,
-#                 input_lengths,
-#                 target_lengths,
-#             )
-
-#             loss = segmentation_loss(
-#                 logits_batch=logits_batch,
-#                 targets=targets,
-#                 target_lengths=target_lengths,
-#             )
-
-#             accelerator.backward(loss)
-
-#             if accelerator.sync_gradients:
-#                 accelerator.clip_grad_norm_(
-#                     model.parameters(),
-#                     max_norm=5.0,
-#                 )
-
-#             optimizer.step()
-
-#             batch_segment_count = int(
-#                 target_lengths.sum().item()
-#             )
-
-#             train_loss_sum += (
-#                 loss.detach().item()
-#                 * batch_segment_count
-#             )
-
-#             train_segment_count += batch_segment_count
-
-#             train_progress.set_postfix(
-#                 loss=f"{loss.detach().item():.4f}"
-#             )
-
-#         train_stats = torch.tensor(
-#             [
-#                 train_loss_sum,
-#                 train_segment_count,
-#             ],
-#             dtype=torch.float64,
-#             device=accelerator.device,
-#         )
-
-#         train_stats = accelerator.reduce(
-#             train_stats,
-#             reduction="sum",
-#         )
-
-#         global_train_loss_sum = train_stats[0].item()
-#         global_train_segment_count = int(
-#             train_stats[1].item()
-#         )
-
-#         if global_train_segment_count == 0:
-#             raise RuntimeError(
-#                 "Training loader produced zero target segments"
-#             )
-
-#         avg_train_loss = (
-#             global_train_loss_sum
-#             / global_train_segment_count
-#         )
-
-#         model.eval()
-
-#         val_loss_sum = 0.0
-#         val_correct_segments = 0
-#         val_segment_count = 0
-
-#         boundary_debug = None
-
-#         val_progress = tqdm(
-#             val_loader,
-#             desc=f"Validation epoch {epoch + 1}",
-#             disable=not accelerator.is_local_main_process,
-#         )
-
-#         with torch.no_grad():
-#             for (
-#                 waveforms,
-#                 targets,
-#                 input_lengths,
-#                 target_lengths,
-#             ) in val_progress:
-
-#                 (
-#                     logits_batch,
-#                     segment_lengths,
-#                     hard_boundaries_batch,
-#                     hidden_lengths,
-#                 ) = model(
-#                     waveforms,
-#                     input_lengths,
-#                     target_lengths,
-#                 )
-
-#                 loss = segmentation_loss(
-#                     logits_batch=logits_batch,
-#                     targets=targets,
-#                     target_lengths=target_lengths,
-#                 )
-
-#                 batch_segment_count = int(
-#                     target_lengths.sum().item()
-#                 )
-
-#                 val_loss_sum += (
-#                     loss.detach().item()
-#                     * batch_segment_count
-#                 )
-
-#                 val_segment_count += batch_segment_count
-
-#                 for b, logits in enumerate(logits_batch):
-
-#                     N = int(
-#                         target_lengths[b].item()
-#                     )
-
-#                     predictions = torch.argmax(
-#                         logits,
-#                         dim=-1,
-#                     )
-
-#                     target = targets[b, :N].to(
-#                         predictions.device
-#                     )
-
-#                     val_correct_segments += int(
-#                         (
-#                             predictions == target
-#                         ).sum().item()
-#                     )
-
-#                 if (
-#                     boundary_debug is None
-#                     and accelerator.is_main_process
-#                 ):
-#                     sample_index = 0
-
-#                     N = int(
-#                         target_lengths[
-#                             sample_index
-#                         ].item()
-#                     )
-
-#                     boundary_debug = {
-#                         "predictions": torch.argmax(
-#                             logits_batch[sample_index],
-#                             dim=-1,
-#                         ).detach().cpu(),
-#                         "targets": targets[
-#                             sample_index,
-#                             :N,
-#                         ].detach().cpu(),
-#                         "boundaries": hard_boundaries_batch[
-#                             sample_index
-#                         ].detach().cpu(),
-#                         "segment_masses": segment_lengths[
-#                             sample_index
-#                         ].detach().cpu(),
-#                         "input_length": int(
-#                             input_lengths[
-#                                 sample_index
-#                             ].item()
-#                         ),
-#                         "hidden_length": int(
-#                             hidden_lengths[
-#                                 sample_index
-#                             ].item()
-#                         ),
-#                         "target_length": N,
-#                     }
-
-#                 val_progress.set_postfix(
-#                     loss=f"{loss.detach().item():.4f}"
-#                 )
-
-#         validation_stats = torch.tensor(
-#             [
-#                 val_loss_sum,
-#                 val_correct_segments,
-#                 val_segment_count,
-#             ],
-#             dtype=torch.float64,
-#             device=accelerator.device,
-#         )
-
-#         validation_stats = accelerator.reduce(
-#             validation_stats,
-#             reduction="sum",
-#         )
-
-#         global_val_loss_sum = (
-#             validation_stats[0].item()
-#         )
-
-#         global_val_correct_segments = int(
-#             validation_stats[1].item()
-#         )
-
-#         global_val_segment_count = int(
-#             validation_stats[2].item()
-#         )
-
-#         if global_val_segment_count == 0:
-#             raise RuntimeError(
-#                 "Validation loader produced zero target segments"
-#             )
-
-#         avg_val_loss = (
-#             global_val_loss_sum
-#             / global_val_segment_count
-#         )
-
-#         val_accuracy = (
-#             global_val_correct_segments
-#             / global_val_segment_count
-#         )
-
-#         if epoch < warmup_epochs:
-#             warmup_scheduler.step()
-#         else:
-#             plateau_scheduler.step(
-#                 avg_val_loss
-#             )
-
-#         if accelerator.is_main_process:
-
-#             print()
-#             print(
-#                 f"Epoch {epoch + 1}/{end_epoch}"
-#             )
-#             print(
-#                 f"  Train Loss   : "
-#                 f"{avg_train_loss:.4f}"
-#             )
-#             print(
-#                 f"  Val Loss     : "
-#                 f"{avg_val_loss:.4f}"
-#             )
-#             print(
-#                 f"  Val Accuracy : "
-#                 f"{val_accuracy:.2%}"
-#             )
-#             print(
-#                 f"  Correct      : "
-#                 f"{global_val_correct_segments}"
-#                 f"/{global_val_segment_count}"
-#             )
-
-#             for group_index, group in enumerate(
-#                 optimizer.param_groups
-#             ):
-#                 print(
-#                     f"  LR group {group_index}: "
-#                     f"{group['lr']:.8g}"
-#                 )
-
-#             print("-" * 60)
-
-#         should_print_boundaries = (
-#             print_boundaries_every is not None
-#             and print_boundaries_every > 0
-#             and (epoch + 1) % print_boundaries_every == 0
-#         )
-
-#         if (
-#             accelerator.is_main_process
-#             and should_print_boundaries
-#             and boundary_debug is not None
-#         ):
-#             unwrapped_model = (
-#                 accelerator.unwrap_model(model)
-#             )
-
-#             boundary_data = (
-#                 unwrapped_model.boundaries_to_seconds(
-#                     boundaries=boundary_debug[
-#                         "boundaries"
-#                     ],
-#                     input_length=boundary_debug[
-#                         "input_length"
-#                     ],
-#                     hidden_length=boundary_debug[
-#                         "hidden_length"
-#                     ],
-#                     sample_rate=SR,
-#                 )
-#             )
-
-#             predictions = boundary_debug[
-#                 "predictions"
-#             ]
-
-#             target_ids = boundary_debug[
-#                 "targets"
-#             ]
-
-#             segment_masses = boundary_debug[
-#                 "segment_masses"
-#             ]
-
-#             N = boundary_debug[
-#                 "target_length"
-#             ]
-
-#             print()
-#             print(
-#                 "Predicted phoneme boundaries"
-#             )
-#             print(
-#                 "=" * 100
-#             )
-
-#             for segment_index in range(N):
-
-#                 prediction_id = int(
-#                     predictions[
-#                         segment_index
-#                     ].item()
-#                 )
-
-#                 target_id = int(
-#                     target_ids[
-#                         segment_index
-#                     ].item()
-#                 )
-
-#                 predicted_phoneme = (
-#                     id_to_phoneme[
-#                         prediction_id
-#                     ]
-#                 )
-
-#                 target_phoneme = (
-#                     id_to_phoneme[
-#                         target_id
-#                     ]
-#                 )
-
-#                 boundary = boundary_data[
-#                     segment_index
-#                 ]
-
-#                 segment_mass = float(
-#                     segment_masses[
-#                         segment_index
-#                     ].item()
-#                 )
-
-#                 is_correct = (
-#                     prediction_id == target_id
-#                 )
-
-#                 status = (
-#                     "correct"
-#                     if is_correct
-#                     else "wrong"
-#                 )
-
-#                 print(
-#                     f"{segment_index:03d} | "
-#                     f"target={target_phoneme:<8} | "
-#                     f"pred={predicted_phoneme:<8} | "
-#                     f"{status:<7} | "
-#                     f"frames=["
-#                     f"{boundary['start_frame']:4d}, "
-#                     f"{boundary['end_frame']:4d}) | "
-#                     f"time=["
-#                     f"{boundary['start_seconds']:7.3f}, "
-#                     f"{boundary['end_seconds']:7.3f}) s | "
-#                     f"duration="
-#                     f"{boundary['duration_seconds']:6.3f} s | "
-#                     f"soft_mass="
-#                     f"{segment_mass:6.2f}"
-#                 )
-
-#             print(
-#                 "=" * 100
-#             )
-#             print()
-
-#         improved = (
-#             avg_val_loss < best_val_loss
-#         )
-
-#         if improved:
-#             best_val_loss = avg_val_loss
-#             epochs_no_improve = 0
-#         else:
-#             epochs_no_improve += 1
-
-#         accelerator.wait_for_everyone()
-
-#         if accelerator.is_main_process:
-
-#             unwrapped_model = (
-#                 accelerator.unwrap_model(model)
-#             )
-
-#             if improved:
-#                 save_checkpoint(
-#                     model=unwrapped_model,
-#                     optimizer=optimizer,
-#                     epoch=epoch,
-#                     val_loss=avg_val_loss,
-#                     best_val_loss=best_val_loss,
-#                     epochs_no_improve=epochs_no_improve,
-#                     warmup_scheduler=warmup_scheduler,
-#                     plateau_scheduler=plateau_scheduler,
-#                     path=WORKING_BEST_MODEL_PATH,
-#                 )
-
-#                 print(
-#                     "Best model saved"
-#                 )
-
-#             save_checkpoint(
-#                 model=unwrapped_model,
-#                 optimizer=optimizer,
-#                 epoch=epoch,
-#                 val_loss=avg_val_loss,
-#                 best_val_loss=best_val_loss,
-#                 epochs_no_improve=epochs_no_improve,
-#                 warmup_scheduler=warmup_scheduler,
-#                 plateau_scheduler=plateau_scheduler,
-#                 path=WORKING_MODEL_PATH,
-#             )
-
-#         accelerator.wait_for_everyone()
-
-#         if epochs_no_improve >= patience:
-
-#             if accelerator.is_main_process:
-#                 print(
-#                     f"Early stopping at epoch "
-#                     f"{epoch + 1}"
-#                 )
-
-#             break
-
-#     return (
-#         best_val_loss,
-#         epochs_no_improve,
-#     )
-
-# %%
-# best_val_loss, epochs_no_improve = train_model(
+# best_validation_per = train_model(
 #     model=model,
 #     train_loader=train_loader,
 #     val_loader=val_loader,
@@ -2442,376 +2365,972 @@ print("training is starting .......")
 #     plateau_scheduler=plateau_scheduler,
 #     accelerator=accelerator,
 #     epochs=NUM_EPOCHS,
-#     patience=6,
-#     best_val_loss=best_val_loss,
-#     epochs_no_improve=epochs_no_improve,
-#     start_epoch=start_epoch,
 #     warmup_epochs=WARMUP_EPOCHS,
-#     print_boundaries_every=1,
+#     count_loss_weight=0.1,
+#     best_validation_per=best_validation_per
 # )
 
 # %%
-# def test_external_audio(
-#     audio_path,
-#     correct_target,
-#     model,
-#     accelerator,
-#     phoneme_to_id,
-#     id_to_phoneme,
-#     sample_rate=16000,
-#     print_result=True,
-# ):
-#     import ast
-#     import torch
+def align_phoneme_sequences(
+    reference,
+    hypothesis,
+):
+    """
+    Levenshtein alignment.
 
-#     if isinstance(correct_target, str):
-#         target_text = correct_target.strip()
+    Returns an aligned sequence of operations:
+        match
+        substitute
+        delete
+        insert
+    """
 
-#         if target_text.startswith("["):
-#             correct_target = ast.literal_eval(
-#                 target_text
-#             )
-#         else:
-#             correct_target = target_text.split()
+    reference = list(reference)
+    hypothesis = list(hypothesis)
 
-#     if not isinstance(
-#         correct_target,
-#         (list, tuple),
-#     ):
-#         raise TypeError(
-#             "correct_target must be a list of phonemes "
-#             "or a string representation of a list"
-#         )
+    reference_length = len(reference)
+    hypothesis_length = len(hypothesis)
 
-#     correct_target = list(correct_target)
+    costs = [
+        [0] * (hypothesis_length + 1)
+        for _ in range(reference_length + 1)
+    ]
 
-#     if len(correct_target) == 0:
-#         raise ValueError(
-#             "correct_target cannot be empty"
-#         )
+    operations = [
+        [None] * (hypothesis_length + 1)
+        for _ in range(reference_length + 1)
+    ]
 
-#     unknown_phonemes = [
-#         phoneme
-#         for phoneme in correct_target
-#         if phoneme not in phoneme_to_id
-#     ]
+    for reference_index in range(
+        1,
+        reference_length + 1,
+    ):
+        costs[reference_index][0] = (
+            reference_index
+        )
 
-#     if unknown_phonemes:
-#         raise ValueError(
-#             f"Unknown phonemes: {unknown_phonemes}"
-#         )
+        operations[reference_index][0] = (
+            "delete"
+        )
 
-#     waveform = load_waveform(
-#         audio_path=audio_path,
-#         sr=sample_rate,
-#         training=False,
-#     )
+    for hypothesis_index in range(
+        1,
+        hypothesis_length + 1,
+    ):
+        costs[0][hypothesis_index] = (
+            hypothesis_index
+        )
 
-#     original_num_samples = waveform.shape[0]
-#     audio_duration_seconds = (
-#         original_num_samples / sample_rate
-#     )
+        operations[0][hypothesis_index] = (
+            "insert"
+        )
 
-#     waveform = waveform.unsqueeze(0)
+    for reference_index in range(
+        1,
+        reference_length + 1,
+    ):
+        for hypothesis_index in range(
+            1,
+            hypothesis_length + 1,
+        ):
+            reference_phoneme = reference[
+                reference_index - 1
+            ]
 
-#     input_lengths = torch.tensor(
-#         [original_num_samples],
-#         dtype=torch.long,
-#     )
+            hypothesis_phoneme = hypothesis[
+                hypothesis_index - 1
+            ]
 
-#     target_ids = torch.tensor(
-#         [
-#             phoneme_to_id[phoneme]
-#             for phoneme in correct_target
-#         ],
-#         dtype=torch.long,
-#     )
+            if (
+                reference_phoneme
+                == hypothesis_phoneme
+            ):
+                costs[
+                    reference_index
+                ][
+                    hypothesis_index
+                ] = costs[
+                    reference_index - 1
+                ][
+                    hypothesis_index - 1
+                ]
 
-#     target_lengths = torch.tensor(
-#         [len(correct_target)],
-#         dtype=torch.long,
-#     )
+                operations[
+                    reference_index
+                ][
+                    hypothesis_index
+                ] = "match"
 
-#     waveform = waveform.to(
-#         accelerator.device
-#     )
+                continue
 
-#     input_lengths = input_lengths.to(
-#         accelerator.device
-#     )
+            substitution_cost = (
+                costs[
+                    reference_index - 1
+                ][
+                    hypothesis_index - 1
+                ]
+                + 1
+            )
 
-#     target_lengths = target_lengths.to(
-#         accelerator.device
-#     )
+            deletion_cost = (
+                costs[
+                    reference_index - 1
+                ][
+                    hypothesis_index
+                ]
+                + 1
+            )
 
-#     target_ids = target_ids.to(
-#         accelerator.device
-#     )
+            insertion_cost = (
+                costs[
+                    reference_index
+                ][
+                    hypothesis_index - 1
+                ]
+                + 1
+            )
 
-#     model.eval()
+            minimum_cost = min(
+                substitution_cost,
+                deletion_cost,
+                insertion_cost,
+            )
 
-#     with torch.no_grad():
-#         (
-#             logits_batch,
-#             segment_lengths,
-#             hard_boundaries_batch,
-#             hidden_lengths,
-#         ) = model(
-#             waveform,
-#             input_lengths,
-#             target_lengths,
-#         )
+            costs[
+                reference_index
+            ][
+                hypothesis_index
+            ] = minimum_cost
 
-#     logits = logits_batch[0]
+            if (
+                minimum_cost
+                == substitution_cost
+            ):
+                operations[
+                    reference_index
+                ][
+                    hypothesis_index
+                ] = "substitute"
 
-#     predicted_ids = torch.argmax(
-#         logits,
-#         dim=-1,
-#     )
+            elif (
+                minimum_cost
+                == deletion_cost
+            ):
+                operations[
+                    reference_index
+                ][
+                    hypothesis_index
+                ] = "delete"
 
-#     probabilities = torch.softmax(
-#         logits,
-#         dim=-1,
-#     )
+            else:
+                operations[
+                    reference_index
+                ][
+                    hypothesis_index
+                ] = "insert"
 
-#     predicted_confidences = probabilities.max(
-#         dim=-1
-#     ).values
+    alignment = []
 
-#     hard_boundaries = (
-#         hard_boundaries_batch[0]
-#     )
+    reference_index = reference_length
+    hypothesis_index = hypothesis_length
 
-#     soft_segment_masses = (
-#         segment_lengths[0]
-#     )
+    while (
+        reference_index > 0
+        or hypothesis_index > 0
+    ):
+        operation = operations[
+            reference_index
+        ][
+            hypothesis_index
+        ]
 
-#     hidden_length = int(
-#         hidden_lengths[0].item()
-#     )
+        if operation == "match":
+            alignment.append(
+                {
+                    "operation": "match",
+                    "reference_index": (
+                        reference_index - 1
+                    ),
+                    "hypothesis_index": (
+                        hypothesis_index - 1
+                    ),
+                    "target_phoneme": reference[
+                        reference_index - 1
+                    ],
+                    "predicted_phoneme": hypothesis[
+                        hypothesis_index - 1
+                    ],
+                }
+            )
 
-#     unwrapped_model = (
-#         accelerator.unwrap_model(model)
-#     )
+            reference_index -= 1
+            hypothesis_index -= 1
 
-#     boundary_data = (
-#         unwrapped_model.boundaries_to_seconds(
-#             boundaries=hard_boundaries,
-#             input_length=original_num_samples,
-#             hidden_length=hidden_length,
-#             sample_rate=sample_rate,
-#         )
-#     )
+        elif operation == "substitute":
+            alignment.append(
+                {
+                    "operation": "substitute",
+                    "reference_index": (
+                        reference_index - 1
+                    ),
+                    "hypothesis_index": (
+                        hypothesis_index - 1
+                    ),
+                    "target_phoneme": reference[
+                        reference_index - 1
+                    ],
+                    "predicted_phoneme": hypothesis[
+                        hypothesis_index - 1
+                    ],
+                }
+            )
 
-#     total_stride = 1
+            reference_index -= 1
+            hypothesis_index -= 1
 
-#     for stride in unwrapped_model.conv_stride:
-#         total_stride *= stride
+        elif operation == "delete":
+            alignment.append(
+                {
+                    "operation": "delete",
+                    "reference_index": (
+                        reference_index - 1
+                    ),
+                    "hypothesis_index": None,
+                    "target_phoneme": reference[
+                        reference_index - 1
+                    ],
+                    "predicted_phoneme": None,
+                }
+            )
 
-#     nominal_frame_duration_seconds = (
-#         total_stride / sample_rate
-#     )
+            reference_index -= 1
 
-#     results = []
-#     correct_count = 0
+        elif operation == "insert":
+            alignment.append(
+                {
+                    "operation": "insert",
+                    "reference_index": None,
+                    "hypothesis_index": (
+                        hypothesis_index - 1
+                    ),
+                    "target_phoneme": None,
+                    "predicted_phoneme": hypothesis[
+                        hypothesis_index - 1
+                    ],
+                }
+            )
 
-#     for index in range(
-#         len(correct_target)
-#     ):
-#         predicted_id = int(
-#             predicted_ids[index].item()
-#         )
+            hypothesis_index -= 1
 
-#         target_id = int(
-#             target_ids[index].item()
-#         )
+        else:
+            raise RuntimeError(
+                "Invalid Levenshtein operation "
+                f"at ({reference_index}, "
+                f"{hypothesis_index})"
+            )
 
-#         predicted_phoneme = (
-#             id_to_phoneme[predicted_id]
-#         )
+    alignment.reverse()
 
-#         target_phoneme = (
-#             id_to_phoneme[target_id]
-#         )
+    substitutions = sum(
+        item["operation"] == "substitute"
+        for item in alignment
+    )
 
-#         is_correct = (
-#             predicted_id == target_id
-#         )
+    deletions = sum(
+        item["operation"] == "delete"
+        for item in alignment
+    )
 
-#         if is_correct:
-#             correct_count += 1
+    insertions = sum(
+        item["operation"] == "insert"
+        for item in alignment
+    )
 
-#         boundary = boundary_data[index]
+    matches = sum(
+        item["operation"] == "match"
+        for item in alignment
+    )
 
-#         start_frame = int(
-#             boundary["start_frame"]
-#         )
+    return {
+        "alignment": alignment,
+        "matches": matches,
+        "substitutions": substitutions,
+        "deletions": deletions,
+        "insertions": insertions,
+        "total_errors": (
+            substitutions
+            + deletions
+            + insertions
+        ),
+    }
 
-#         end_frame = int(
-#             boundary["end_frame"]
-#         )
+# %%
+def test_external_audio(
+    audio_path,
+    model,
+    accelerator,
+    id_to_phoneme,
+    phoneme_to_id=None,
+    correct_target=None,
+    sample_rate=16000,
+    print_result=True,
+):
+    import ast
+    import torch
 
-#         frame_count = (
-#             end_frame - start_frame
-#         )
+    # ============================================================
+    # Parse optional reference target
+    # ============================================================
 
-#         segment_duration = float(
-#             boundary["duration_seconds"]
-#         )
+    if correct_target is not None:
+        if isinstance(correct_target, str):
+            target_text = correct_target.strip()
 
-#         if frame_count > 0:
-#             average_frame_duration = (
-#                 segment_duration / frame_count
-#             )
-#         else:
-#             average_frame_duration = 0.0
+            if target_text.startswith("["):
+                correct_target = ast.literal_eval(
+                    target_text
+                )
+            else:
+                correct_target = (
+                    target_text.split()
+                )
 
-#         result = {
-#             "index": index,
-#             "target_phoneme": target_phoneme,
-#             "predicted_phoneme": predicted_phoneme,
-#             "correct": is_correct,
-#             "confidence": float(
-#                 predicted_confidences[
-#                     index
-#                 ].item()
-#             ),
-#             "start_frame": start_frame,
-#             "end_frame": end_frame,
-#             "frame_count": frame_count,
-#             "start_sample": int(
-#                 boundary["start_sample"]
-#             ),
-#             "end_sample": int(
-#                 boundary["end_sample"]
-#             ),
-#             "start_seconds": float(
-#                 boundary["start_seconds"]
-#             ),
-#             "end_seconds": float(
-#                 boundary["end_seconds"]
-#             ),
-#             "duration_seconds": segment_duration,
-#             "average_frame_duration_seconds": (
-#                 average_frame_duration
-#             ),
-#             "nominal_frame_duration_seconds": (
-#                 nominal_frame_duration_seconds
-#             ),
-#             "soft_segment_mass": float(
-#                 soft_segment_masses[
-#                     index
-#                 ].item()
-#             ),
-#         }
+        if not isinstance(
+            correct_target,
+            (list, tuple),
+        ):
+            raise TypeError(
+                "correct_target must be None, "
+                "a list of phonemes, or a string"
+            )
 
-#         results.append(result)
+        correct_target = list(
+            correct_target
+        )
 
-#     total_segments = len(correct_target)
+        if len(correct_target) == 0:
+            raise ValueError(
+                "correct_target cannot be empty "
+                "when it is provided"
+            )
 
-#     segment_accuracy = (
-#         correct_count / total_segments
-#     )
+        if phoneme_to_id is not None:
+            unknown_phonemes = [
+                phoneme
+                for phoneme in correct_target
+                if phoneme not in phoneme_to_id
+            ]
 
-#     predicted_phonemes = [
-#         result["predicted_phoneme"]
-#         for result in results
-#     ]
+            if unknown_phonemes:
+                raise ValueError(
+                    f"Unknown phonemes: "
+                    f"{unknown_phonemes}"
+                )
 
-#     output = {
-#         "audio_path": audio_path,
-#         "sample_rate": sample_rate,
-#         "audio_samples": original_num_samples,
-#         "audio_duration_seconds": (
-#             audio_duration_seconds
-#         ),
-#         "encoder_frame_count": hidden_length,
-#         "nominal_frame_duration_seconds": (
-#             nominal_frame_duration_seconds
-#         ),
-#         "correct_target": correct_target,
-#         "predicted_phonemes": (
-#             predicted_phonemes
-#         ),
-#         "correct_segments": correct_count,
-#         "total_segments": total_segments,
-#         "segment_accuracy": segment_accuracy,
-#         "segments": results,
-#     }
+    # ============================================================
+    # Load audio
+    # ============================================================
 
-#     if print_result:
-#         print()
-#         print(
-#             f"Audio: {audio_path}"
-#         )
-#         print(
-#             f"Audio duration: "
-#             f"{audio_duration_seconds:.3f} seconds"
-#         )
-#         print(
-#             f"Encoder frames: {hidden_length}"
-#         )
-#         print(
-#             f"Nominal frame duration: "
-#             f"{nominal_frame_duration_seconds * 1000:.2f} ms"
-#         )
-#         print(
-#             f"Correct segments: "
-#             f"{correct_count}/{total_segments}"
-#         )
-#         print(
-#             f"Segment accuracy: "
-#             f"{segment_accuracy:.2%}"
-#         )
-#         print()
-#         print(
-#             "Predicted phoneme boundaries"
-#         )
-#         print("=" * 130)
+    waveform = load_waveform(
+        audio_path=audio_path,
+        sr=sample_rate,
+        training=False,
+    )
 
-#         for result in results:
-#             status = (
-#                 "correct"
-#                 if result["correct"]
-#                 else "wrong"
-#             )
+    original_num_samples = int(
+        waveform.shape[0]
+    )
 
-#             print(
-#                 f"{result['index']:03d} | "
-#                 f"target={result['target_phoneme']:<9} | "
-#                 f"pred={result['predicted_phoneme']:<9} | "
-#                 f"{status:<7} | "
-#                 f"confidence={result['confidence']:.3f} | "
-#                 f"frames=["
-#                 f"{result['start_frame']:4d}, "
-#                 f"{result['end_frame']:4d}) | "
-#                 f"count={result['frame_count']:3d} | "
-#                 f"time=["
-#                 f"{result['start_seconds']:7.3f}, "
-#                 f"{result['end_seconds']:7.3f}) s | "
-#                 f"duration="
-#                 f"{result['duration_seconds']:6.3f} s | "
-#                 f"frame_duration="
-#                 f"{result['average_frame_duration_seconds'] * 1000:6.2f} ms | "
-#                 f"soft_mass="
-#                 f"{result['soft_segment_mass']:6.2f}"
-#             )
+    audio_duration_seconds = (
+        original_num_samples
+        / sample_rate
+    )
 
-#         print("=" * 130)
+    waveform_batch = (
+        waveform
+        .unsqueeze(0)
+        .to(accelerator.device)
+    )
 
-#         print()
-#         print(
-#             "Correct target:"
-#         )
-#         print(correct_target)
+    input_lengths = torch.tensor(
+        [original_num_samples],
+        dtype=torch.long,
+        device=accelerator.device,
+    )
 
-#         print()
-#         print(
-#             "Predicted phonemes:"
-#         )
-#         print(predicted_phonemes)
+    # ============================================================
+    # Autonomous inference
+    # ============================================================
 
-#     return output
+    model.eval()
+
+    with torch.inference_mode():
+        with accelerator.autocast():
+            (
+                logits_batch,
+                segment_lengths,
+                hard_boundaries_batch,
+                hidden_lengths,
+                raw_predicted_counts,
+                predicted_lengths,
+            ) = model(
+                waveform_batch,
+                input_lengths,
+            )
+
+    # Important:
+    # no target length was passed into the model.
+
+    logits = logits_batch[0].float()
+
+    probabilities = torch.softmax(
+        logits,
+        dim=-1,
+    )
+
+    (
+        predicted_confidences,
+        predicted_ids,
+    ) = probabilities.max(
+        dim=-1
+    )
+
+    predicted_ids = (
+        predicted_ids
+        .detach()
+        .cpu()
+    )
+
+    predicted_confidences = (
+        predicted_confidences
+        .detach()
+        .cpu()
+    )
+
+    hard_boundaries = (
+        hard_boundaries_batch[0]
+        .detach()
+        .cpu()
+    )
+
+    soft_segment_masses = (
+        segment_lengths[0]
+        .detach()
+        .cpu()
+    )
+
+    hidden_length = int(
+        hidden_lengths[0].item()
+    )
+
+    raw_predicted_count = float(
+        raw_predicted_counts[0]
+        .float()
+        .item()
+    )
+
+    predicted_count = int(
+        predicted_lengths[0].item()
+    )
+
+    actual_output_count = int(
+        predicted_ids.shape[0]
+    )
+
+    if actual_output_count != predicted_count:
+        raise RuntimeError(
+            "The predicted length does not match "
+            "the number of output segments: "
+            f"{predicted_count} versus "
+            f"{actual_output_count}"
+        )
+
+    predicted_phonemes = [
+        id_to_phoneme[
+            int(phoneme_id.item())
+        ]
+        for phoneme_id in predicted_ids
+    ]
+
+    # ============================================================
+    # Convert boundaries to time
+    # ============================================================
+
+    unwrapped_model = (
+        accelerator.unwrap_model(model)
+    )
+
+    boundary_data = (
+        unwrapped_model.boundaries_to_seconds(
+            boundaries=hard_boundaries,
+            input_length=original_num_samples,
+            hidden_length=hidden_length,
+            sample_rate=sample_rate,
+        )
+    )
+
+    total_stride = 1
+
+    for stride in unwrapped_model.conv_stride:
+        total_stride *= stride
+
+    nominal_frame_duration_seconds = (
+        total_stride / sample_rate
+    )
+
+    # ============================================================
+    # Build predicted segment information
+    # ============================================================
+
+    results = []
+
+    for index in range(
+        predicted_count
+    ):
+        predicted_id = int(
+            predicted_ids[index].item()
+        )
+
+        predicted_phoneme = (
+            id_to_phoneme[predicted_id]
+        )
+
+        boundary = boundary_data[index]
+
+        start_frame = int(
+            boundary["start_frame"]
+        )
+
+        end_frame = int(
+            boundary["end_frame"]
+        )
+
+        frame_count = (
+            end_frame - start_frame
+        )
+
+        segment_duration = float(
+            boundary["duration_seconds"]
+        )
+
+        if frame_count > 0:
+            average_frame_duration = (
+                segment_duration
+                / frame_count
+            )
+        else:
+            average_frame_duration = 0.0
+
+        result = {
+            "index": index,
+            "predicted_id": predicted_id,
+            "predicted_phoneme": (
+                predicted_phoneme
+            ),
+            "confidence": float(
+                predicted_confidences[
+                    index
+                ].item()
+            ),
+            "start_frame": start_frame,
+            "end_frame": end_frame,
+            "frame_count": frame_count,
+            "start_sample": int(
+                boundary["start_sample"]
+            ),
+            "end_sample": int(
+                boundary["end_sample"]
+            ),
+            "start_seconds": float(
+                boundary["start_seconds"]
+            ),
+            "end_seconds": float(
+                boundary["end_seconds"]
+            ),
+            "duration_seconds": (
+                segment_duration
+            ),
+            "average_frame_duration_seconds": (
+                average_frame_duration
+            ),
+            "nominal_frame_duration_seconds": (
+                nominal_frame_duration_seconds
+            ),
+            "soft_segment_mass": float(
+                soft_segment_masses[
+                    index
+                ].item()
+            ),
+
+            # Filled only when correct_target
+            # is provided.
+            "target_phoneme": None,
+            "alignment_operation": None,
+            "correct": None,
+        }
+
+        results.append(result)
+
+    # ============================================================
+    # Optional reference evaluation
+    # ============================================================
+
+    evaluation = None
+    alignment = None
+
+    if correct_target is not None:
+        alignment_result = (
+            align_phoneme_sequences(
+                reference=correct_target,
+                hypothesis=(
+                    predicted_phonemes
+                ),
+            )
+        )
+
+        alignment = alignment_result[
+            "alignment"
+        ]
+
+        matches = alignment_result[
+            "matches"
+        ]
+
+        substitutions = alignment_result[
+            "substitutions"
+        ]
+
+        deletions = alignment_result[
+            "deletions"
+        ]
+
+        insertions = alignment_result[
+            "insertions"
+        ]
+
+        total_errors = alignment_result[
+            "total_errors"
+        ]
+
+        reference_count = len(
+            correct_target
+        )
+
+        alignment_length = (
+            matches
+            + substitutions
+            + deletions
+            + insertions
+        )
+
+        phoneme_error_rate = (
+            total_errors
+            / reference_count
+        )
+
+        reference_match_accuracy = (
+            matches
+            / reference_count
+        )
+
+        alignment_accuracy = (
+            matches
+            / max(
+                alignment_length,
+                1,
+            )
+        )
+
+        exact_sequence = (
+            total_errors == 0
+        )
+
+        count_error = abs(
+            predicted_count
+            - reference_count
+        )
+
+        evaluation = {
+            "reference_count": (
+                reference_count
+            ),
+            "predicted_count": (
+                predicted_count
+            ),
+            "count_error": count_error,
+            "count_is_exact": (
+                count_error == 0
+            ),
+            "matches": matches,
+            "substitutions": (
+                substitutions
+            ),
+            "deletions": deletions,
+            "insertions": insertions,
+            "total_errors": (
+                total_errors
+            ),
+            "phoneme_error_rate": (
+                phoneme_error_rate
+            ),
+            "reference_match_accuracy": (
+                reference_match_accuracy
+            ),
+            "alignment_accuracy": (
+                alignment_accuracy
+            ),
+            "exact_sequence": (
+                exact_sequence
+            ),
+        }
+
+        # Attach alignment results to the
+        # corresponding predicted segment.
+        for alignment_item in alignment:
+            hypothesis_index = (
+                alignment_item[
+                    "hypothesis_index"
+                ]
+            )
+
+            if hypothesis_index is None:
+                # Deletion has no predicted
+                # segment and therefore no boundary.
+                continue
+
+            results[
+                hypothesis_index
+            ][
+                "target_phoneme"
+            ] = alignment_item[
+                "target_phoneme"
+            ]
+
+            results[
+                hypothesis_index
+            ][
+                "alignment_operation"
+            ] = alignment_item[
+                "operation"
+            ]
+
+            results[
+                hypothesis_index
+            ][
+                "correct"
+            ] = (
+                alignment_item["operation"]
+                == "match"
+            )
+
+    # ============================================================
+    # Final output
+    # ============================================================
+
+    output = {
+        "audio_path": audio_path,
+        "sample_rate": sample_rate,
+        "audio_samples": (
+            original_num_samples
+        ),
+        "audio_duration_seconds": (
+            audio_duration_seconds
+        ),
+        "encoder_frame_count": (
+            hidden_length
+        ),
+        "nominal_frame_duration_seconds": (
+            nominal_frame_duration_seconds
+        ),
+        "raw_predicted_count": (
+            raw_predicted_count
+        ),
+        "predicted_count": (
+            predicted_count
+        ),
+        "predicted_phonemes": (
+            predicted_phonemes
+        ),
+        "correct_target": (
+            correct_target
+        ),
+        "evaluation": evaluation,
+        "alignment": alignment,
+        "segments": results,
+    }
+
+    # ============================================================
+    # Print
+    # ============================================================
+
+    if print_result:
+        print()
+        print(
+            f"Audio: {audio_path}"
+        )
+
+        print(
+            f"Audio duration: "
+            f"{audio_duration_seconds:.3f} seconds"
+        )
+
+        print(
+            f"Encoder frames: "
+            f"{hidden_length}"
+        )
+
+        print(
+            f"Raw predicted count: "
+            f"{raw_predicted_count:.3f}"
+        )
+
+        print(
+            f"Selected phoneme count: "
+            f"{predicted_count}"
+        )
+
+        print(
+            f"Nominal frame duration: "
+            f"{nominal_frame_duration_seconds * 1000:.2f} ms"
+        )
+
+        if evaluation is not None:
+            print()
+            print("Reference evaluation")
+
+            print(
+                f"Target count: "
+                f"{evaluation['reference_count']}"
+            )
+
+            print(
+                f"Count error: "
+                f"{evaluation['count_error']}"
+            )
+
+            print(
+                f"Matches: "
+                f"{evaluation['matches']}"
+            )
+
+            print(
+                f"Substitutions: "
+                f"{evaluation['substitutions']}"
+            )
+
+            print(
+                f"Deletions: "
+                f"{evaluation['deletions']}"
+            )
+
+            print(
+                f"Insertions: "
+                f"{evaluation['insertions']}"
+            )
+
+            print(
+                f"Phoneme error rate: "
+                f"{evaluation['phoneme_error_rate']:.2%}"
+            )
+
+            print(
+                f"Reference match accuracy: "
+                f"{evaluation['reference_match_accuracy']:.2%}"
+            )
+
+            print(
+                f"Alignment accuracy: "
+                f"{evaluation['alignment_accuracy']:.2%}"
+            )
+
+            print(
+                f"Exact sequence: "
+                f"{evaluation['exact_sequence']}"
+            )
+
+        print()
+        print(
+            "Predicted phoneme boundaries"
+        )
+
+        print("=" * 145)
+
+        for result in results:
+            if evaluation is None:
+                alignment_text = (
+                    "not evaluated"
+                )
+
+                target_text = "-"
+            else:
+                alignment_text = (
+                    result[
+                        "alignment_operation"
+                    ]
+                    or "insertion"
+                )
+
+                target_text = (
+                    result["target_phoneme"]
+                    if result["target_phoneme"]
+                    is not None
+                    else "-"
+                )
+
+            print(
+                f"{result['index']:03d} | "
+                f"target={target_text:<9} | "
+                f"pred={result['predicted_phoneme']:<9} | "
+                f"{alignment_text:<11} | "
+                f"confidence={result['confidence']:.3f} | "
+                f"frames=["
+                f"{result['start_frame']:4d}, "
+                f"{result['end_frame']:4d}) | "
+                f"count={result['frame_count']:3d} | "
+                f"time=["
+                f"{result['start_seconds']:7.3f}, "
+                f"{result['end_seconds']:7.3f}) s | "
+                f"duration="
+                f"{result['duration_seconds']:6.3f} s | "
+                f"soft_mass="
+                f"{result['soft_segment_mass']:6.2f}"
+            )
+
+        print("=" * 145)
+
+        if (
+            evaluation is not None
+            and evaluation["deletions"] > 0
+        ):
+            print()
+            print(
+                "Deleted target phonemes:"
+            )
+
+            for alignment_item in alignment:
+                if (
+                    alignment_item[
+                        "operation"
+                    ]
+                    == "delete"
+                ):
+                    print(
+                        f"target index "
+                        f"{alignment_item['reference_index']:03d} | "
+                        f"phoneme="
+                        f"{alignment_item['target_phoneme']}"
+                    )
+
+        if correct_target is not None:
+            print()
+            print("Correct target:")
+            print(correct_target)
+
+        print()
+        print("Predicted phonemes:")
+        print(predicted_phonemes)
+
+    return output
 
 # %%
 # import numpy as np
@@ -2841,835 +3360,28 @@ print("training is starting .......")
 # print(f"Saved {audio_path}")
 
 # %%
-# item = val_df.iloc[0]
-# audio_path =  f"../../datasets/Quran_ds/Quran_ds/audio/audio/{item['path_of_audio']}"
-# target_phonemes = ast.literal_eval(item['phonemes'])
+item = val_df.iloc[1]
+audio_path =  f"../../datasets/Quran_ds/Quran_ds/audio/audio/{item['path_of_audio']}"
+target_phonemes = ast.literal_eval(item['phonemes'])
 
 
-# # audio_path = "../../datasets/test_audios/1.wav"
+# audio_path =  "../../datasets/test_audios/1.wav"
 
-# print(f"Audio path: {audio_path}")
-# print(f"Target phonemes: {target_phonemes}")
+# audio_path = "../../datasets/QDAT_Quran_DS/FINAL SOUND/FINAL SOUND/S10_1.wav"
 
-# %%
-# result = test_external_audio(
-#     audio_path=audio_path,
-#     correct_target=target_phonemes,
-#     model=model,
-#     accelerator=accelerator, 
-#     phoneme_to_id=phoneme_to_id,
-#     id_to_phoneme=id_to_phoneme,
-#     sample_rate=SR,
-# )
+# target_phonemes =['qaa', 'luu', 'su', 'bK', 'ħaa', 'na', 'ka', 'laa', 'ʕi', 'l', 'ma', 'la', 'naa', 'ʔi', 'l', 'laa', 'maa', 'ʕa', 'l', 'la', 'm', 'ta', 'naa', 'ʔi', 'nn', 'na', 'ka', 'ʔa', 'nt', 'ta', 'l', 'ʕa', 'lii', 'mu', 'l', 'ħa', 'kii', 'm']
+
+print(f"Audio path: {audio_path}")
+print(f"Target phonemes: {target_phonemes}")
 
 # %%
-# from collections import Counter
-# import ast
-
-# counter = Counter()
-
-# for phonemes in train_df["phonemes"]:
-#     seq = ast.literal_eval(phonemes)
-#     counter.update(seq)
-
-# print(len(counter))
-
-# print(counter["<sil>"])
-# print(counter.most_common())
-
-# %%
-# import os
-# import torch
-# import numpy as np
-# import pandas as pd
-# import matplotlib.pyplot as plt
-
-# from tqdm.auto import tqdm
-# from sklearn.metrics import confusion_matrix
-
-
-# @torch.no_grad()
-# def collect_validation_predictions(
-#     model,
-#     val_loader,
-#     accelerator,
-# ):
-#     model.eval()
-
-#     all_target_ids = []
-#     all_prediction_ids = []
-
-#     progress_bar = tqdm(
-#         val_loader,
-#         desc="Collecting validation predictions",
-#         disable=not accelerator.is_local_main_process,
-#     )
-
-#     for (
-#         waveforms,
-#         targets,
-#         input_lengths,
-#         target_lengths,
-#     ) in progress_bar:
-
-#         (
-#             logits_batch,
-#             segment_lengths,
-#             hard_boundaries_batch,
-#             hidden_lengths,
-#         ) = model(
-#             waveforms,
-#             input_lengths,
-#             target_lengths,
-#         )
-
-#         for batch_index, logits in enumerate(
-#             logits_batch
-#         ):
-#             target_length = int(
-#                 target_lengths[
-#                     batch_index
-#                 ].item()
-#             )
-
-#             predictions = torch.argmax(
-#                 logits,
-#                 dim=-1,
-#             )
-
-#             targets_for_sample = targets[
-#                 batch_index,
-#                 :target_length,
-#             ]
-
-#             predictions = (
-#                 predictions.detach()
-#                 .cpu()
-#                 .long()
-#             )
-
-#             targets_for_sample = (
-#                 targets_for_sample.detach()
-#                 .cpu()
-#                 .long()
-#             )
-
-#             if predictions.numel() != target_length:
-#                 raise RuntimeError(
-#                     f"Prediction length "
-#                     f"{predictions.numel()} does not match "
-#                     f"target length {target_length}"
-#                 )
-
-#             valid_mask = (
-#                 targets_for_sample != -100
-#             )
-
-#             all_prediction_ids.append(
-#                 predictions[valid_mask]
-#             )
-
-#             all_target_ids.append(
-#                 targets_for_sample[valid_mask]
-#             )
-
-#     if len(all_target_ids) == 0:
-#         raise RuntimeError(
-#             "No validation predictions were collected"
-#         )
-
-#     all_target_ids = torch.cat(
-#         all_target_ids
-#     ).numpy()
-
-#     all_prediction_ids = torch.cat(
-#         all_prediction_ids
-#     ).numpy()
-
-#     return (
-#         all_target_ids,
-#         all_prediction_ids,
-#     )
-
-
-# def safe_row_normalize(matrix):
-#     matrix = matrix.astype(
-#         np.float64
-#     )
-
-#     row_sums = matrix.sum(
-#         axis=1,
-#         keepdims=True,
-#     )
-
-#     normalized = np.divide(
-#         matrix,
-#         row_sums,
-#         out=np.zeros_like(
-#             matrix,
-#             dtype=np.float64,
-#         ),
-#         where=row_sums != 0,
-#     )
-
-#     return normalized
-
-
-# def build_per_phoneme_report(
-#     full_confusion_matrix,
-#     label_ids,
-#     id_to_phoneme,
-# ):
-#     rows = []
-
-#     for matrix_index, phoneme_id in enumerate(
-#         label_ids
-#     ):
-#         support = int(
-#             full_confusion_matrix[
-#                 matrix_index
-#             ].sum()
-#         )
-
-#         correct = int(
-#             full_confusion_matrix[
-#                 matrix_index,
-#                 matrix_index,
-#             ]
-#         )
-
-#         accuracy = (
-#             correct / support
-#             if support > 0
-#             else 0.0
-#         )
-
-#         predicted_count = int(
-#             full_confusion_matrix[
-#                 :,
-#                 matrix_index,
-#             ].sum()
-#         )
-
-#         rows.append(
-#             {
-#                 "phoneme_id": int(
-#                     phoneme_id
-#                 ),
-#                 "phoneme": id_to_phoneme[
-#                     int(phoneme_id)
-#                 ],
-#                 "support": support,
-#                 "correct": correct,
-#                 "incorrect": (
-#                     support - correct
-#                 ),
-#                 "predicted_count": (
-#                     predicted_count
-#                 ),
-#                 "accuracy": accuracy,
-#                 "accuracy_percent": (
-#                     accuracy * 100.0
-#                 ),
-#             }
-#         )
-
-#     report = pd.DataFrame(
-#         rows
-#     )
-
-#     report = report.sort_values(
-#         by=[
-#             "accuracy",
-#             "support",
-#         ],
-#         ascending=[
-#             True,
-#             False,
-#         ],
-#     ).reset_index(
-#         drop=True
-#     )
-
-#     return report
-
-
-# def build_top_confusion_report(
-#     full_confusion_matrix,
-#     label_ids,
-#     id_to_phoneme,
-# ):
-#     confusion_records = []
-
-#     for true_index, true_id in enumerate(
-#         label_ids
-#     ):
-#         true_support = int(
-#             full_confusion_matrix[
-#                 true_index
-#             ].sum()
-#         )
-
-#         for predicted_index, predicted_id in enumerate(
-#             label_ids
-#         ):
-#             if true_index == predicted_index:
-#                 continue
-
-#             error_count = int(
-#                 full_confusion_matrix[
-#                     true_index,
-#                     predicted_index,
-#                 ]
-#             )
-
-#             if error_count == 0:
-#                 continue
-
-#             error_rate = (
-#                 error_count / true_support
-#                 if true_support > 0
-#                 else 0.0
-#             )
-
-#             confusion_records.append(
-#                 {
-#                     "actual_phoneme": (
-#                         id_to_phoneme[
-#                             int(true_id)
-#                         ]
-#                     ),
-#                     "predicted_phoneme": (
-#                         id_to_phoneme[
-#                             int(predicted_id)
-#                         ]
-#                     ),
-#                     "error_count": (
-#                         error_count
-#                     ),
-#                     "actual_support": (
-#                         true_support
-#                     ),
-#                     "error_rate": (
-#                         error_rate
-#                     ),
-#                     "error_rate_percent": (
-#                         error_rate * 100.0
-#                     ),
-#                 }
-#             )
-
-#     report = pd.DataFrame(
-#         confusion_records
-#     )
-
-#     if len(report) == 0:
-#         return report
-
-#     report = report.sort_values(
-#         by=[
-#             "error_count",
-#             "error_rate",
-#         ],
-#         ascending=[
-#             False,
-#             False,
-#         ],
-#     ).reset_index(
-#         drop=True
-#     )
-
-#     return report
-
-
-# def plot_confusion_matrix(
-#     matrix,
-#     phoneme_names,
-#     title,
-#     output_path,
-#     normalized=True,
-# ):
-#     class_count = len(
-#         phoneme_names
-#     )
-
-#     figure_size = max(
-#         12,
-#         min(
-#             32,
-#             class_count * 0.55,
-#         ),
-#     )
-
-#     figure, axis = plt.subplots(
-#         figsize=(
-#             figure_size,
-#             figure_size,
-#         )
-#     )
-
-#     image = axis.imshow(
-#         matrix,
-#         interpolation="nearest",
-#         aspect="auto",
-#     )
-
-#     figure.colorbar(
-#         image,
-#         ax=axis,
-#         fraction=0.046,
-#         pad=0.04,
-#     )
-
-#     axis.set_title(
-#         title
-#     )
-
-#     axis.set_xlabel(
-#         "Predicted phoneme"
-#     )
-
-#     axis.set_ylabel(
-#         "Actual phoneme"
-#     )
-
-#     tick_positions = np.arange(
-#         class_count
-#     )
-
-#     axis.set_xticks(
-#         tick_positions
-#     )
-
-#     axis.set_yticks(
-#         tick_positions
-#     )
-
-#     axis.set_xticklabels(
-#         phoneme_names,
-#         rotation=90,
-#         fontsize=8,
-#     )
-
-#     axis.set_yticklabels(
-#         phoneme_names,
-#         fontsize=8,
-#     )
-
-#     if class_count <= 25:
-#         maximum_value = (
-#             matrix.max()
-#             if matrix.size > 0
-#             else 0
-#         )
-
-#         threshold = (
-#             maximum_value / 2.0
-#         )
-
-#         for row_index in range(
-#             class_count
-#         ):
-#             for column_index in range(
-#                 class_count
-#             ):
-#                 value = matrix[
-#                     row_index,
-#                     column_index,
-#                 ]
-
-#                 if normalized:
-#                     display_value = (
-#                         f"{value:.2f}"
-#                     )
-#                 else:
-#                     display_value = (
-#                         str(int(value))
-#                     )
-
-#                 axis.text(
-#                     column_index,
-#                     row_index,
-#                     display_value,
-#                     horizontalalignment="center",
-#                     verticalalignment="center",
-#                     fontsize=7,
-#                 )
-
-#     figure.tight_layout()
-
-#     figure.savefig(
-#         output_path,
-#         dpi=250,
-#         bbox_inches="tight",
-#     )
-
-#     plt.show()
-#     plt.close(
-#         figure
-#     )
-
-
-# def create_phoneme_confusion_matrix(
-#     model,
-#     val_loader,
-#     accelerator,
-#     id_to_phoneme,
-#     top_k=40,
-#     output_directory="confusion_matrix_results",
-# ):
-#     os.makedirs(
-#         output_directory,
-#         exist_ok=True,
-#     )
-
-#     (
-#         target_ids,
-#         prediction_ids,
-#     ) = collect_validation_predictions(
-#         model=model,
-#         val_loader=val_loader,
-#         accelerator=accelerator,
-#     )
-
-#     total_phoneme_count = len(
-#         id_to_phoneme
-#     )
-
-#     true_counts = np.bincount(
-#         target_ids,
-#         minlength=total_phoneme_count,
-#     )
-
-#     predicted_counts = np.bincount(
-#         prediction_ids,
-#         minlength=total_phoneme_count,
-#     )
-
-#     active_label_ids = np.where(
-#         (
-#             true_counts
-#             + predicted_counts
-#         ) > 0
-#     )[0]
-
-#     full_matrix = confusion_matrix(
-#         target_ids,
-#         prediction_ids,
-#         labels=active_label_ids,
-#     )
-
-#     full_normalized_matrix = (
-#         safe_row_normalize(
-#             full_matrix
-#         )
-#     )
-
-#     active_phoneme_names = [
-#         id_to_phoneme[
-#             int(phoneme_id)
-#         ]
-#         for phoneme_id in active_label_ids
-#     ]
-
-#     full_count_dataframe = pd.DataFrame(
-#         full_matrix,
-#         index=active_phoneme_names,
-#         columns=active_phoneme_names,
-#     )
-
-#     full_normalized_dataframe = pd.DataFrame(
-#         full_normalized_matrix,
-#         index=active_phoneme_names,
-#         columns=active_phoneme_names,
-#     )
-
-#     full_count_path = os.path.join(
-#         output_directory,
-#         "full_confusion_matrix_counts.csv",
-#     )
-
-#     full_normalized_path = os.path.join(
-#         output_directory,
-#         "full_confusion_matrix_normalized.csv",
-#     )
-
-#     full_count_dataframe.to_csv(
-#         full_count_path
-#     )
-
-#     full_normalized_dataframe.to_csv(
-#         full_normalized_path
-#     )
-
-#     per_phoneme_report = (
-#         build_per_phoneme_report(
-#             full_confusion_matrix=full_matrix,
-#             label_ids=active_label_ids,
-#             id_to_phoneme=id_to_phoneme,
-#         )
-#     )
-
-#     per_phoneme_path = os.path.join(
-#         output_directory,
-#         "per_phoneme_accuracy.csv",
-#     )
-
-#     per_phoneme_report.to_csv(
-#         per_phoneme_path,
-#         index=False,
-#     )
-
-#     top_confusions = (
-#         build_top_confusion_report(
-#             full_confusion_matrix=full_matrix,
-#             label_ids=active_label_ids,
-#             id_to_phoneme=id_to_phoneme,
-#         )
-#     )
-
-#     top_confusions_path = os.path.join(
-#         output_directory,
-#         "top_phoneme_confusions.csv",
-#     )
-
-#     top_confusions.to_csv(
-#         top_confusions_path,
-#         index=False,
-#     )
-
-#     overall_accuracy = float(
-#         (
-#             target_ids
-#             == prediction_ids
-#         ).mean()
-#     )
-
-#     if top_k is None:
-#         selected_label_ids = (
-#             active_label_ids
-#         )
-#     else:
-#         top_k = min(
-#             int(top_k),
-#             len(active_label_ids),
-#         )
-
-#         active_true_counts = true_counts[
-#             active_label_ids
-#         ]
-
-#         frequency_order = np.argsort(
-#             active_true_counts
-#         )[::-1]
-
-#         selected_label_ids = (
-#             active_label_ids[
-#                 frequency_order[:top_k]
-#             ]
-#         )
-
-#     other_id = -1
-
-#     selected_set = set(
-#         selected_label_ids.tolist()
-#     )
-
-#     mapped_targets = np.array(
-#         [
-#             target_id
-#             if target_id in selected_set
-#             else other_id
-#             for target_id in target_ids
-#         ],
-#         dtype=np.int64,
-#     )
-
-#     mapped_predictions = np.array(
-#         [
-#             prediction_id
-#             if prediction_id in selected_set
-#             else other_id
-#             for prediction_id in prediction_ids
-#         ],
-#         dtype=np.int64,
-#     )
-
-#     display_label_ids = list(
-#         selected_label_ids
-#     )
-
-#     if (
-#         np.any(
-#             mapped_targets == other_id
-#         )
-#         or np.any(
-#             mapped_predictions == other_id
-#         )
-#     ):
-#         display_label_ids.append(
-#             other_id
-#         )
-
-#     display_names = [
-#         (
-#             "<other>"
-#             if phoneme_id == other_id
-#             else id_to_phoneme[
-#                 int(phoneme_id)
-#             ]
-#         )
-#         for phoneme_id in display_label_ids
-#     ]
-
-#     display_matrix = confusion_matrix(
-#         mapped_targets,
-#         mapped_predictions,
-#         labels=display_label_ids,
-#     )
-
-#     display_normalized_matrix = (
-#         safe_row_normalize(
-#             display_matrix
-#         )
-#     )
-
-#     count_plot_path = os.path.join(
-#         output_directory,
-#         "confusion_matrix_counts.png",
-#     )
-
-#     normalized_plot_path = os.path.join(
-#         output_directory,
-#         "confusion_matrix_normalized.png",
-#     )
-
-#     plot_confusion_matrix(
-#         matrix=display_matrix,
-#         phoneme_names=display_names,
-#         title=(
-#             "Phoneme confusion matrix — counts"
-#         ),
-#         output_path=count_plot_path,
-#         normalized=False,
-#     )
-
-#     plot_confusion_matrix(
-#         matrix=display_normalized_matrix,
-#         phoneme_names=display_names,
-#         title=(
-#             "Phoneme confusion matrix — normalized"
-#         ),
-#         output_path=normalized_plot_path,
-#         normalized=True,
-#     )
-
-#     print()
-#     print(
-#         f"Total evaluated phonemes: "
-#         f"{len(target_ids)}"
-#     )
-
-#     print(
-#         f"Overall segment accuracy: "
-#         f"{overall_accuracy:.2%}"
-#     )
-
-#     print(
-#         f"Active phoneme classes: "
-#         f"{len(active_label_ids)}"
-#     )
-
-#     print()
-#     print(
-#         "Saved files:"
-#     )
-
-#     print(
-#         full_count_path
-#     )
-
-#     print(
-#         full_normalized_path
-#     )
-
-#     print(
-#         per_phoneme_path
-#     )
-
-#     print(
-#         top_confusions_path
-#     )
-
-#     print(
-#         count_plot_path
-#     )
-
-#     print(
-#         normalized_plot_path
-#     )
-
-#     return {
-#         "target_ids": target_ids,
-#         "prediction_ids": (
-#             prediction_ids
-#         ),
-#         "overall_accuracy": (
-#             overall_accuracy
-#         ),
-#         "full_confusion_matrix": (
-#             full_matrix
-#         ),
-#         "full_normalized_matrix": (
-#             full_normalized_matrix
-#         ),
-#         "per_phoneme_report": (
-#             per_phoneme_report
-#         ),
-#         "top_confusions": (
-#             top_confusions
-#         ),
-#         "full_count_dataframe": (
-#             full_count_dataframe
-#         ),
-#         "full_normalized_dataframe": (
-#             full_normalized_dataframe
-#         ),
-#     }
-
-# %%
-# confusion_results = (
-#     create_phoneme_confusion_matrix(
-#         model=model,
-#         val_loader=val_loader,
-#         accelerator=accelerator,
-#         id_to_phoneme=id_to_phoneme,
-#         top_k=40,
-#         output_directory=(
-#             "confusion_matrix_results"
-#         ),
-#     )
-# )
-
-# %%
-# display(
-#     confusion_results[
-#         "top_confusions"
-#     ].head(30)
-# )
-
-# per_phoneme = confusion_results[
-#     "per_phoneme_report"
-# ]
-
-# weak_phonemes = per_phoneme[
-#     per_phoneme["support"] >= 20
-# ].sort_values(
-#     by="accuracy"
-# )
-
-# display(
-#     weak_phonemes.head(30)
-# )
+output = test_external_audio(
+    audio_path=audio_path,
+    model=model,
+    accelerator=accelerator,
+    id_to_phoneme=id_to_phoneme,
+    phoneme_to_id=phoneme_to_id,
+    correct_target=target_phonemes,
+)
 
 
