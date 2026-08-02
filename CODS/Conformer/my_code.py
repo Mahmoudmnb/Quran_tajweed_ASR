@@ -25,6 +25,8 @@ import numpy as np
 import ast
 from typing import Dict, List
 import os
+import random
+import math
 
 # %%
 # ? this is for local training
@@ -54,7 +56,7 @@ TEST_DS_PATH = "../../datasets/Quran_ds/quran_test.csv"
 DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
 BATCH_SIZE = 1
-SR = 16000
+SR = 16000 
 NUM_EPOCHS = 8
 
 DEVICE
@@ -173,159 +175,1081 @@ def suppress_c_stderr():
             os.close(old_fd)
 
 
-def add_noise(signal, noise_level=0.003):
-    return signal + noise_level * np.random.randn(len(signal))
+# Speed perturbation
+SPEED_PROBABILITY = 0.25
+
+SPEED_FACTORS = (
+    0.95,  # slower and slightly longer
+    1.05,  # faster and slightly shorter
+)
+
+NORMALIZED_PEAK = 0.8
+
+# Random gain
+GAIN_PROBABILITY = 0.50
+MIN_GAIN = 0.8
+MAX_GAIN = 1.2
+
+# SNR-based noise
+NOISE_PROBABILITY = 0.35
+MIN_SNR_DB = 15.0
+MAX_SNR_DB = 35.0
+
+# Mild reverberation
+REVERB_PROBABILITY = 0.25
+
+REVERB_PROFILES = {
+    "ordinary_room": {
+        "rt60_range": (
+            0.20,
+            0.45,
+        ),
+        "wet_mix_range": (
+            0.08,
+            0.16,
+        ),
+        "reflection_delay_ms": (
+            8.0,
+            45.0,
+        ),
+        "reflection_count": (
+            3,
+            6,
+        ),
+    },
+
+    "mosque": {
+        "rt60_range": (
+            0.80,
+            1.40,
+        ),
+        "wet_mix_range": (
+            0.08,
+            0.18,
+        ),
+        "reflection_delay_ms": (
+            20.0,
+            120.0,
+        ),
+        "reflection_count": (
+            6,
+            12,
+        ),
+    },
+
+    "distant_microphone": {
+        "rt60_range": (
+            0.35,
+            0.80,
+        ),
+        "wet_mix_range": (
+            0.12,
+            0.22,
+        ),
+        "reflection_delay_ms": (
+            12.0,
+            80.0,
+        ),
+        "reflection_count": (
+            5,
+            9,
+        ),
+    },
+}
+
+def get_audio_duration(file_path):
+    info = torchaudio.info(file_path)
+    duration = info.num_frames / info.sample_rate
+    return duration
+
+@torch.no_grad()
+def apply_speed_perturbation(
+    signal,
+    sample_rate,
+    speed_factor=None,
+):
+    """
+    Change waveform speed while keeping the waveform
+    usable at the model sample rate.
+
+    speed_factor > 1.0:
+        Faster and shorter.
+
+    speed_factor < 1.0:
+        Slower and longer.
+    """
+
+    signal = np.asarray(
+        signal,
+        dtype=np.float32,
+    )
+
+    if signal.ndim != 1:
+        raise ValueError(
+            "Speed perturbation expects a mono "
+            "one-dimensional waveform"
+        )
+
+    if len(signal) == 0:
+        raise ValueError(
+            "Cannot apply speed perturbation "
+            "to an empty waveform"
+        )
+
+    if speed_factor is None:
+        speed_factor = float(
+            np.random.choice(
+                SPEED_FACTORS
+            )
+        )
+
+    speed_factor = float(
+        speed_factor
+    )
+
+    if speed_factor <= 0:
+        raise ValueError(
+            "speed_factor must be greater "
+            "than zero"
+        )
+
+    waveform = torch.from_numpy(
+        signal
+    ).unsqueeze(0)
+
+    input_lengths = torch.tensor(
+        [waveform.shape[-1]],
+        dtype=torch.long,
+    )
+
+    (
+        perturbed_waveform,
+        perturbed_lengths,
+    ) = torchaudio.functional.speed(
+        waveform=waveform,
+        orig_freq=sample_rate,
+        factor=speed_factor,
+        lengths=input_lengths,
+    )
+
+    valid_length = int(
+        perturbed_lengths[0].item()
+    )
+
+    perturbed_waveform = (
+        perturbed_waveform[
+            0,
+            :valid_length,
+        ]
+        .contiguous()
+        .numpy()
+        .astype(np.float32)
+    )
+
+    if len(perturbed_waveform) == 0:
+        raise RuntimeError(
+            "Speed perturbation produced "
+            "an empty waveform"
+        )
+
+    if not np.all(
+        np.isfinite(
+            perturbed_waveform
+        )
+    ):
+        raise RuntimeError(
+            "Speed perturbation produced "
+            "non-finite waveform values"
+        )
+
+    return perturbed_waveform
+
+def add_noise_at_snr(
+    signal,
+    snr_db=None,
+    min_snr_db=MIN_SNR_DB,
+    max_snr_db=MAX_SNR_DB,
+):
+    """
+    Add zero-mean Gaussian noise at a selected SNR.
+
+    SNR is measured using RMS amplitudes:
+
+        SNR(dB) = 20 * log10(
+            signal_rms / noise_rms
+        )
+    """
+
+    signal = np.asarray(
+        signal,
+        dtype=np.float32,
+    )
+
+    if snr_db is None:
+        snr_db = np.random.uniform(
+            min_snr_db,
+            max_snr_db,
+        )
+
+    signal_rms = float(
+        np.sqrt(
+            np.mean(
+                signal.astype(
+                    np.float64
+                ) ** 2
+            )
+            + 1e-12
+        )
+    )
+
+    if signal_rms < 1e-8:
+        return signal.copy()
+
+    noise = np.random.randn(
+        signal.shape[0]
+    ).astype(
+        np.float32
+    )
+
+    noise_rms = float(
+        np.sqrt(
+            np.mean(
+                noise.astype(
+                    np.float64
+                ) ** 2
+            )
+            + 1e-12
+        )
+    )
+
+    desired_noise_rms = (
+        signal_rms
+        / (
+            10.0
+            ** (
+                float(snr_db)
+                / 20.0
+            )
+        )
+    )
+
+    noise_scale = (
+        desired_noise_rms
+        / max(
+            noise_rms,
+            1e-8,
+        )
+    )
+
+    noisy_signal = (
+        signal
+        + noise * noise_scale
+    )
+
+    return noisy_signal.astype(
+        np.float32
+    )
 
 
-def random_gain(signal):
-    return signal * np.random.uniform(0.8, 1.2)
+def random_gain(
+    signal,
+    min_gain=MIN_GAIN,
+    max_gain=MAX_GAIN,
+):
+    gain = np.random.uniform(
+        min_gain,
+        max_gain,
+    )
 
+    return (
+        signal * gain
+    ).astype(
+        np.float32
+    )
 
-def load_waveform(audio_path, sr=16000, training=True):
+def fft_convolve_same_length(
+    signal,
+    impulse_response,
+):
+    """
+    FFT convolution while retaining the original
+    waveform length.
+    """
+
+    signal = np.asarray(
+        signal,
+        dtype=np.float32,
+    )
+
+    impulse_response = np.asarray(
+        impulse_response,
+        dtype=np.float32,
+    )
+
+    full_length = (
+        len(signal)
+        + len(impulse_response)
+        - 1
+    )
+
+    fft_length = (
+        1
+        << (
+            full_length - 1
+        ).bit_length()
+    )
+
+    signal_fft = np.fft.rfft(
+        signal,
+        n=fft_length,
+    )
+
+    impulse_fft = np.fft.rfft(
+        impulse_response,
+        n=fft_length,
+    )
+
+    convolved = np.fft.irfft(
+        signal_fft * impulse_fft,
+        n=fft_length,
+    )
+
+    convolved = convolved[
+        :len(signal)
+    ]
+
+    return convolved.astype(
+        np.float32
+    )
+
+def create_synthetic_rir(
+    sample_rate,
+    profile_name,
+):
+    """
+    Build a mild synthetic room impulse response
+    containing early reflections and a decaying tail.
+    """
+
+    if (
+        profile_name
+        not in REVERB_PROFILES
+    ):
+        raise ValueError(
+            f"Unknown reverb profile: "
+            f"{profile_name}"
+        )
+
+    profile = REVERB_PROFILES[
+        profile_name
+    ]
+
+    rt60 = np.random.uniform(
+        *profile[
+            "rt60_range"
+        ]
+    )
+
+    wet_mix = np.random.uniform(
+        *profile[
+            "wet_mix_range"
+        ]
+    )
+
+    minimum_rir_length = int(
+        0.05 * sample_rate
+    )
+
+    rir_length = max(
+        int(
+            rt60 * sample_rate
+        ),
+        minimum_rir_length,
+    )
+
+    time = (
+        np.arange(
+            rir_length,
+            dtype=np.float32,
+        )
+        / float(sample_rate)
+    )
+
+    # Amplitude falls to approximately 0.001
+    # at t = RT60, corresponding to -60 dB.
+    decay = np.power(
+        10.0,
+        -3.0
+        * time
+        / max(
+            rt60,
+            1e-3,
+        ),
+    ).astype(
+        np.float32
+    )
+
+    # Low-level diffuse late-reverberation tail.
+    late_tail = np.random.randn(
+        rir_length
+    ).astype(
+        np.float32
+    )
+
+    # Mild smoothing prevents an excessively
+    # harsh white-noise-like reverb.
+    smoothing_kernel = np.array(
+        [
+            0.20,
+            0.60,
+            0.20,
+        ],
+        dtype=np.float32,
+    )
+
+    late_tail = np.convolve(
+        late_tail,
+        smoothing_kernel,
+        mode="same",
+    ).astype(
+        np.float32
+    )
+
+    impulse_response = (
+        0.03
+        * late_tail
+        * decay
+    )
+
+    # Keep the first few milliseconds empty.
+    # The dry signal is added separately.
+    initial_silence = min(
+        int(
+            0.005
+            * sample_rate
+        ),
+        rir_length,
+    )
+
+    impulse_response[
+        :initial_silence
+    ] = 0.0
+
+    minimum_reflections, maximum_reflections = (
+        profile[
+            "reflection_count"
+        ]
+    )
+
+    reflection_count = np.random.randint(
+        minimum_reflections,
+        maximum_reflections + 1,
+    )
+
+    minimum_delay, maximum_delay = (
+        profile[
+            "reflection_delay_ms"
+        ]
+    )
+
+    for _ in range(
+        reflection_count
+    ):
+        delay_ms = np.random.uniform(
+            minimum_delay,
+            maximum_delay,
+        )
+
+        delay_sample = int(
+            delay_ms
+            * sample_rate
+            / 1000.0
+        )
+
+        delay_sample = min(
+            delay_sample,
+            rir_length - 1,
+        )
+
+        reflection_amplitude = (
+            np.random.uniform(
+                0.15,
+                0.65,
+            )
+            * decay[
+                delay_sample
+            ]
+        )
+
+        # Reflections may undergo phase inversion.
+        if np.random.rand() < 0.5:
+            reflection_amplitude *= -1.0
+
+        impulse_response[
+            delay_sample
+        ] += reflection_amplitude
+
+    rir_energy = float(
+        np.sqrt(
+            np.sum(
+                impulse_response.astype(
+                    np.float64
+                ) ** 2
+            )
+            + 1e-12
+        )
+    )
+
+    if rir_energy < 1e-8:
+        raise RuntimeError(
+            "Generated impulse response "
+            "has zero energy"
+        )
+
+    impulse_response = (
+        impulse_response
+        / rir_energy
+    )
+
+    return (
+        impulse_response.astype(
+            np.float32
+        ),
+        float(wet_mix),
+    )
+
+def apply_mild_reverb(
+    signal,
+    sample_rate,
+    profile_name=None,
+):
+    signal = np.asarray(
+        signal,
+        dtype=np.float32,
+    )
+
+    if profile_name is None:
+        profile_name = np.random.choice(
+            [
+                "ordinary_room",
+                "mosque",
+                "distant_microphone",
+            ],
+            p=[
+                0.50,
+                0.25,
+                0.25,
+            ],
+        )
+
+    (
+        impulse_response,
+        wet_mix,
+    ) = create_synthetic_rir(
+        sample_rate=sample_rate,
+        profile_name=profile_name,
+    )
+
+    wet_signal = fft_convolve_same_length(
+        signal=signal,
+        impulse_response=(
+            impulse_response
+        ),
+    )
+
+    dry_rms = float(
+        np.sqrt(
+            np.mean(
+                signal.astype(
+                    np.float64
+                ) ** 2
+            )
+            + 1e-12
+        )
+    )
+
+    wet_rms = float(
+        np.sqrt(
+            np.mean(
+                wet_signal.astype(
+                    np.float64
+                ) ** 2
+            )
+            + 1e-12
+        )
+    )
+
+    if (
+        dry_rms > 1e-8
+        and wet_rms > 1e-8
+    ):
+        wet_signal = (
+            wet_signal
+            * (
+                dry_rms
+                / wet_rms
+            )
+        )
+
+    reverberated_signal = (
+        (
+            1.0 - wet_mix
+        )
+        * signal
+        + wet_mix
+        * wet_signal
+    )
+
+    return reverberated_signal.astype(
+        np.float32
+    )
+
+def load_waveform(
+    audio_path,
+    sr=16000,
+    training=True,
+):
+    signal = None
 
     # audio_path = audio_path.replace(".wav", ".mp3")
 
-    signal = None
 
-    # ── Step 1: try torchaudio — fast, no temp files ──────────────────────
+    # ============================================================
+    # 1. Load using torchaudio
+    # ============================================================
+
     try:
+        waveform, original_sample_rate = (
+            torchaudio.load(
+                audio_path
+            )
+        )
 
-        waveform, orig_sr = torchaudio.load(audio_path)
-
-        # Stereo → mono
         if waveform.shape[0] > 1:
-            waveform = waveform.mean(dim=0, keepdim=True)
+            waveform = waveform.mean(
+                dim=0,
+                keepdim=True,
+            )
 
-        # Resample if needed
-        if orig_sr != sr:
-            waveform = T.Resample(orig_freq=orig_sr, new_freq=sr)(waveform)
+        if original_sample_rate != sr:
+            waveform = T.Resample(
+                orig_freq=(
+                    original_sample_rate
+                ),
+                new_freq=sr,
+            )(waveform)
 
-        signal = waveform.squeeze(0).numpy()
+        signal = (
+            waveform
+            .squeeze(0)
+            .numpy()
+        )
 
-    # ── Step 2: fallback to librosa for corrupt MP3 frames ────────────────
+    # ============================================================
+    # 2. Fallback to librosa
+    # ============================================================
+
     except Exception:
         try:
             with suppress_c_stderr():
-                signal, _ = librosa.load(audio_path, sr=sr, mono=True)
-        except Exception as e:
-            raise RuntimeError(f"Both loaders failed for: {audio_path} — {e}")
+                signal, _ = librosa.load(
+                    audio_path,
+                    sr=sr,
+                    mono=True,
+                )
 
-    # ── Step 3: guard against silent/empty output ─────────────────────────
+        except Exception as error:
+            raise RuntimeError(
+                f"Both loaders failed for: "
+                f"{audio_path} — {error}"
+            )
+
+    # ============================================================
+    # 3. Validate waveform
+    # ============================================================
+
     if signal is None or len(signal) == 0:
-        raise RuntimeError(f"Audio is empty: {audio_path}")
+        raise RuntimeError(
+            f"Audio is empty: "
+            f"{audio_path}"
+        )
 
-    if np.max(np.abs(signal)) < 1e-6:
-        raise RuntimeError(f"Audio appears silent or corrupt: {audio_path}")
+    signal = np.asarray(
+        signal,
+        dtype=np.float32,
+    )
 
-    # ── Step 4: augmentation (training only) ──────────────────────────────
-    if training and np.random.rand() < 0.5:
-        signal = add_noise(signal)
+    original_peak = float(
+        np.max(
+            np.abs(signal)
+        )
+    )
 
-    if training and np.random.rand() < 0.5:
-        signal = random_gain(signal)
+    if original_peak < 1e-6:
+        raise RuntimeError(
+            f"Audio appears silent or corrupt: "
+            f"{audio_path}"
+        )
+    
 
-    # ── Step 5: normalize to [-1, 1] ──────────────────────────────────────
-    max_val = np.max(np.abs(signal)) + 1e-8
-    signal = signal / max_val
+    # ============================================================
+    # 4. Mild speed perturbation
+    # ============================================================
+    
+    if (
+        training
+        and np.random.rand()
+        < SPEED_PROBABILITY
+    ):
+        signal = apply_speed_perturbation(
+            signal=signal,
+            sample_rate=sr,
+        )
+        
 
-    return torch.tensor(signal, dtype=torch.float32)
+    # ============================================================
+    # 4. Mild room reverberation
+    # ============================================================
+
+    if (
+        training
+        and np.random.rand()
+        < REVERB_PROBABILITY
+    ):
+        signal = apply_mild_reverb(
+            signal=signal,
+            sample_rate=sr,
+        )
+
+    # ============================================================
+    # 5. SNR-based Gaussian noise
+    # ============================================================
+
+    if (
+        training
+        and np.random.rand()
+        < NOISE_PROBABILITY
+    ):
+        signal = add_noise_at_snr(
+            signal=signal,
+            min_snr_db=MIN_SNR_DB,
+            max_snr_db=MAX_SNR_DB,
+        )
+
+    # ============================================================
+    # 6. Normalize the complete augmented waveform
+    # ============================================================
+    #
+    # Scaling the mixture does not change its SNR
+    # or dry/reverberant relationship.
+    # ============================================================
+
+    augmented_peak = float(
+        np.max(
+            np.abs(signal)
+        )
+    )
+
+    if augmented_peak < 1e-8:
+        raise RuntimeError(
+            f"Waveform became invalid after "
+            f"augmentation: {audio_path}"
+        )
+
+    signal = (
+        signal
+        / augmented_peak
+    ) * NORMALIZED_PEAK
+
+    # ============================================================
+    # 7. Random gain after normalization
+    # ============================================================
+
+    if (
+        training
+        and np.random.rand()
+        < GAIN_PROBABILITY
+    ):
+        signal = random_gain(
+            signal
+        )
+
+    # ============================================================
+    # 8. Final safety check
+    # ============================================================
+
+    signal = np.nan_to_num(
+        signal,
+        nan=0.0,
+        posinf=1.0,
+        neginf=-1.0,
+    )
+
+    signal = np.clip(
+        signal,
+        -1.0,
+        1.0,
+    )
+
+    return torch.tensor(
+        signal,
+        dtype=torch.float32,
+    )
+
 
 # %%
-class DynamicBatchSampler(torch.utils.data.Sampler):
+class DynamicBatchSampler(
+    torch.utils.data.Sampler
+):
     """
-    Groups samples by audio length so each batch contains
-    similarly-lengthed ayahs — minimizes padding waste and OOM risk.
+    Groups recordings by estimated augmented length.
+
+    The batch budget is:
+
+        batch_size * longest_sample_in_batch
+
+    A recording longer than the batch budget is still
+    included, but placed in a singleton batch.
     """
 
-    def __init__(self, dataset, max_samples_per_batch, shuffle=True):
+    def __init__(
+        self,
+        dataset,
+        max_padded_samples_per_batch,
+        shuffle=True,
+        minimum_speed_factor=1.0,
+    ):
         self.dataset = dataset
-        self.max_samples_per_batch = max_samples_per_batch
+
+        self.max_padded_samples_per_batch = int(
+            max_padded_samples_per_batch
+        )
+
         self.shuffle = shuffle
 
-        # Pre-read waveform lengths from the dataframe
-        # (avoids loading audio just to know the length)
-        print("Building length index...")
-        self.lengths = []
-        for idx in range(len(dataset)):
-            row = dataset.df.iloc[idx]
+        self.minimum_speed_factor = float(
+            minimum_speed_factor
+        )
 
-            audio_path = ""
+        if self.max_padded_samples_per_batch <= 0:
+            raise ValueError(
+                "max_padded_samples_per_batch "
+                "must be greater than zero"
+            )
+
+        if self.minimum_speed_factor <= 0:
+            raise ValueError(
+                "minimum_speed_factor must be "
+                "greater than zero"
+            )
+
+        print(
+            "Building length index..."
+        )
+
+        self.original_lengths = []
+        self.estimated_lengths = []
+
+        for index in range(
+            len(dataset)
+        ):
+            row = dataset.df.iloc[
+                index
+            ]
+
             if row["ds_index"] == 1:
-                audio_path = os.path.join(dataset.dataset_path, row["path_of_audio"])
+                audio_path = os.path.join(
+                    dataset.dataset_path,
+                    row["path_of_audio"],
+                )
             else:
-                audio_path = os.path.join(dataset.dataset_path_1, row["path_of_audio"])
+                audio_path = os.path.join(
+                    dataset.dataset_path_1,
+                    row["path_of_audio"],
+                )
 
             try:
-                info = torchaudio.info(audio_path)
-                # Resample length if needed
-                length = int(info.num_frames * SR / info.sample_rate)
+                info = torchaudio.info(
+                    audio_path
+                )
+
+                original_length = int(
+                    info.num_frames
+                    * SR
+                    / info.sample_rate
+                )
+
             except Exception:
-                length = SR * 10  # fallback: assume 10 seconds
-            self.lengths.append(length)
-        print(f"Length index built for {len(self.lengths)} samples")
+                # Conservative fallback:
+                # assume a 10-second recording.
+                original_length = (
+                    SR * 10
+                )
 
-    def __iter__(self):
-        batches = self._build_batches()
-        for batch in batches:
-            yield batch
+            # Slower speed augmentation produces
+            # a longer waveform.
+            estimated_length = math.ceil(
+                original_length
+                / self.minimum_speed_factor
+            )
 
-    def _build_batches(self):
-        import random
+            self.original_lengths.append(
+                original_length
+            )
 
-        indices = list(range(len(self.lengths)))
-        if self.shuffle:
-            random.shuffle(indices)
-        indices.sort(key=lambda i: self.lengths[i])
+            self.estimated_lengths.append(
+                estimated_length
+            )
+
+        over_budget_count = sum(
+            length
+            > self.max_padded_samples_per_batch
+            for length in self.estimated_lengths
+        )
+
+        longest_original_seconds = (
+            max(self.original_lengths)
+            / SR
+        )
+
+        longest_estimated_seconds = (
+            max(self.estimated_lengths)
+            / SR
+        )
+
+        print(
+            f"Length index built for "
+            f"{len(self.estimated_lengths)} samples"
+        )
+
+        print(
+            f"Longest original audio: "
+            f"{longest_original_seconds:.2f} seconds"
+        )
+
+        print(
+            f"Longest estimated audio: "
+            f"{longest_estimated_seconds:.2f} seconds"
+        )
+
+        print(
+            f"Singleton recordings over budget: "
+            f"{over_budget_count}"
+        )
+
+    def _build_batches(
+        self,
+    ):
+        indices = list(
+            range(
+                len(
+                    self.estimated_lengths
+                )
+            )
+        )
+
+        # Sorting keeps similar lengths together.
+        indices.sort(
+            key=lambda index:
+            self.estimated_lengths[index]
+        )
 
         batches = []
-        current_batch = []
-        current_max_len = 0
 
-        for idx in indices:
-            length = self.lengths[idx]
-            new_max = max(current_max_len, length)
+        current_batch = []
+        current_max_length = 0
+
+        for index in indices:
+            length = self.estimated_lengths[
+                index
+            ]
+
+            # Explicitly include an oversized recording
+            # as a singleton batch.
+            if (
+                length
+                > self.max_padded_samples_per_batch
+            ):
+                if current_batch:
+                    batches.append(
+                        current_batch
+                    )
+
+                    current_batch = []
+                    current_max_length = 0
+
+                batches.append(
+                    [index]
+                )
+
+                continue
+
+            new_max_length = max(
+                current_max_length,
+                length,
+            )
+
+            new_batch_size = (
+                len(current_batch) + 1
+            )
+
+            padded_sample_count = (
+                new_batch_size
+                * new_max_length
+            )
+
             if (
                 current_batch
-                and (len(current_batch) + 1) * new_max > self.max_samples_per_batch
+                and padded_sample_count
+                > self.max_padded_samples_per_batch
             ):
-                batches.append(current_batch)
-                current_batch = [idx]
-                current_max_len = length
+                batches.append(
+                    current_batch
+                )
+
+                current_batch = [
+                    index
+                ]
+
+                current_max_length = (
+                    length
+                )
+
             else:
-                current_batch.append(idx)
-                current_max_len = new_max
+                current_batch.append(
+                    index
+                )
+
+                current_max_length = (
+                    new_max_length
+                )
 
         if current_batch:
-            batches.append(current_batch)
+            batches.append(
+                current_batch
+            )
 
         if self.shuffle:
-            random.shuffle(batches)
+            random.shuffle(
+                batches
+            )
 
         return batches
 
-    def __len__(self):
-        # Build once with no shuffle to get stable count
-        indices = list(range(len(self.lengths)))
-        indices.sort(key=lambda i: self.lengths[i])
-        batches = []
-        current_batch = []
-        current_max_len = 0
-        for idx in indices:
-            length = self.lengths[idx]
-            new_max = max(current_max_len, length)
-            if (
-                current_batch
-                and (len(current_batch) + 1) * new_max > self.max_samples_per_batch
-            ):
-                batches.append(current_batch)
-                current_batch = [idx]
-                current_max_len = length
-            else:
-                current_batch.append(idx)
-                current_max_len = new_max
-        if current_batch:
-            batches.append(current_batch)
-        return len(batches)
+    def __iter__(
+        self,
+    ):
+        batches = self._build_batches()
+
+        for batch in batches:
+            yield batch
+
+    def __len__(
+        self,
+    ):
+        return len(
+            self._build_batches()
+        )
 
 # %%
 class TajweedCTCDataset(Dataset):
@@ -463,12 +1387,13 @@ class SegmentClassifier(nn.Module):
 
 # %%
 class SegmentationHead(nn.Module):
-    def __init__(self, hidden_dim=512, embedding_dim=64):
+    def __init__(self, hidden_dim=512, embedding_dim=64,dropout=0.1):
         super().__init__()
 
         self.embedding = nn.Sequential(
             nn.Linear(hidden_dim, 256),
             nn.ReLU(),
+            # nn.Dropout(dropout),
             nn.Linear(256, embedding_dim),
         )
 
@@ -508,7 +1433,7 @@ for param in wav2vec2_model.parameters():
 # %%
 class ASRModel(torch.nn.Module):
 
-    def __init__(self, wav2vec2, spec_augment):
+    def __init__(self, wav2vec2, spec_augment,dropout=0.1):
         super().__init__()
         self.wav2vec2 = wav2vec2.feature_extractor
         
@@ -526,12 +1451,13 @@ class ASRModel(torch.nn.Module):
             ffn_dim=2048,
             num_layers=4,
             depthwise_conv_kernel_size=31,
-            dropout=0.1,
+            dropout=dropout,
         )
 
         self.segmentation = SegmentationHead(
             hidden_dim=512,
             embedding_dim=64,
+            dropout=dropout,
         )
 
         self.segment_classifier = SegmentClassifier(
@@ -1000,37 +1926,62 @@ val_dataset = TajweedCTCDataset(
 )
 
 
+
+MAX_PADDED_AUDIO_SECONDS = 20
+
+MAX_PADDED_SAMPLES_PER_BATCH = int(
+    SR
+    * MAX_PADDED_AUDIO_SECONDS
+)
+
+MINIMUM_TRAIN_SPEED_FACTOR = min(
+    SPEED_FACTORS
+)
+
+
 MAX_TOKENS =  BATCH_SIZE * 16000 * 20
 
 train_sampler = DynamicBatchSampler(
-    train_dataset,
-    max_samples_per_batch=MAX_TOKENS,
+    dataset=train_dataset,
+    max_padded_samples_per_batch=(
+        MAX_PADDED_SAMPLES_PER_BATCH
+    ),
     shuffle=True,
+    minimum_speed_factor=(
+        MINIMUM_TRAIN_SPEED_FACTOR
+    ),
 )
 
+
 val_sampler = DynamicBatchSampler(
-    val_dataset,
-    max_samples_per_batch=MAX_TOKENS,
+    dataset=val_dataset,
+    max_padded_samples_per_batch=(
+        MAX_PADDED_SAMPLES_PER_BATCH
+    ),
     shuffle=False,
+    minimum_speed_factor=1.0,
 )
+
+NUM_WORKERS = 2
 
 train_loader = DataLoader(
     train_dataset,
     batch_sampler=train_sampler,
-    # batch_size=BATCH_SIZE,
     collate_fn=ctc_collate,
-    num_workers=1,
-    pin_memory=True,
+    num_workers=NUM_WORKERS,
+    pin_memory=torch.cuda.is_available(),
+    persistent_workers=True,
 )
 
 val_loader = DataLoader(
     val_dataset,
     batch_sampler=val_sampler,
-    # batch_size=BATCH_SIZE,
     collate_fn=ctc_collate,
-    num_workers=1,
-    pin_memory=True,
+    num_workers=NUM_WORKERS,
+    pin_memory=torch.cuda.is_available(),
+    persistent_workers=True,
 )
+
 
 # %%
 # next(enumerate(train_loader))
@@ -1273,7 +2224,7 @@ print(f"Using device: {DEVICE}")
 print(f"Num processes: {accelerator.num_processes}")
 
 
-model = ASRModel(wav2vec2_model, SpecAugment())
+model = ASRModel(wav2vec2_model, SpecAugment(),dropout=0.1)
 
 del wav2vec2_model
 
@@ -1406,6 +2357,7 @@ def segmentation_loss(
     return F.cross_entropy(
         all_logits,
         all_targets,
+        label_smoothing=0.05,
     )
 
 # %%
@@ -2356,981 +3308,981 @@ def train_model(
 print("training is starting .......")
 
 # %%
-# best_validation_per = train_model(
-#     model=model,
-#     train_loader=train_loader,
-#     val_loader=val_loader,
-#     optimizer=optimizer,
-#     warmup_scheduler=warmup_scheduler,
-#     plateau_scheduler=plateau_scheduler,
-#     accelerator=accelerator,
-#     epochs=NUM_EPOCHS,
-#     warmup_epochs=WARMUP_EPOCHS,
-#     count_loss_weight=0.1,
-#     best_validation_per=best_validation_per
-# )
+best_validation_per = train_model(
+    model=model,
+    train_loader=train_loader,
+    val_loader=val_loader,
+    optimizer=optimizer,
+    warmup_scheduler=warmup_scheduler,
+    plateau_scheduler=plateau_scheduler,
+    accelerator=accelerator,
+    epochs=NUM_EPOCHS,
+    warmup_epochs=WARMUP_EPOCHS,
+    count_loss_weight=0.1,
+    best_validation_per=best_validation_per
+)
 
 # %%
-def align_phoneme_sequences(
-    reference,
-    hypothesis,
-):
-    """
-    Levenshtein alignment.
+# def align_phoneme_sequences(
+#     reference,
+#     hypothesis,
+# ):
+#     """
+#     Levenshtein alignment.
 
-    Returns an aligned sequence of operations:
-        match
-        substitute
-        delete
-        insert
-    """
+#     Returns an aligned sequence of operations:
+#         match
+#         substitute
+#         delete
+#         insert
+#     """
 
-    reference = list(reference)
-    hypothesis = list(hypothesis)
+#     reference = list(reference)
+#     hypothesis = list(hypothesis)
 
-    reference_length = len(reference)
-    hypothesis_length = len(hypothesis)
+#     reference_length = len(reference)
+#     hypothesis_length = len(hypothesis)
 
-    costs = [
-        [0] * (hypothesis_length + 1)
-        for _ in range(reference_length + 1)
-    ]
+#     costs = [
+#         [0] * (hypothesis_length + 1)
+#         for _ in range(reference_length + 1)
+#     ]
 
-    operations = [
-        [None] * (hypothesis_length + 1)
-        for _ in range(reference_length + 1)
-    ]
+#     operations = [
+#         [None] * (hypothesis_length + 1)
+#         for _ in range(reference_length + 1)
+#     ]
 
-    for reference_index in range(
-        1,
-        reference_length + 1,
-    ):
-        costs[reference_index][0] = (
-            reference_index
-        )
+#     for reference_index in range(
+#         1,
+#         reference_length + 1,
+#     ):
+#         costs[reference_index][0] = (
+#             reference_index
+#         )
 
-        operations[reference_index][0] = (
-            "delete"
-        )
+#         operations[reference_index][0] = (
+#             "delete"
+#         )
 
-    for hypothesis_index in range(
-        1,
-        hypothesis_length + 1,
-    ):
-        costs[0][hypothesis_index] = (
-            hypothesis_index
-        )
+#     for hypothesis_index in range(
+#         1,
+#         hypothesis_length + 1,
+#     ):
+#         costs[0][hypothesis_index] = (
+#             hypothesis_index
+#         )
 
-        operations[0][hypothesis_index] = (
-            "insert"
-        )
+#         operations[0][hypothesis_index] = (
+#             "insert"
+#         )
 
-    for reference_index in range(
-        1,
-        reference_length + 1,
-    ):
-        for hypothesis_index in range(
-            1,
-            hypothesis_length + 1,
-        ):
-            reference_phoneme = reference[
-                reference_index - 1
-            ]
+#     for reference_index in range(
+#         1,
+#         reference_length + 1,
+#     ):
+#         for hypothesis_index in range(
+#             1,
+#             hypothesis_length + 1,
+#         ):
+#             reference_phoneme = reference[
+#                 reference_index - 1
+#             ]
 
-            hypothesis_phoneme = hypothesis[
-                hypothesis_index - 1
-            ]
+#             hypothesis_phoneme = hypothesis[
+#                 hypothesis_index - 1
+#             ]
 
-            if (
-                reference_phoneme
-                == hypothesis_phoneme
-            ):
-                costs[
-                    reference_index
-                ][
-                    hypothesis_index
-                ] = costs[
-                    reference_index - 1
-                ][
-                    hypothesis_index - 1
-                ]
+#             if (
+#                 reference_phoneme
+#                 == hypothesis_phoneme
+#             ):
+#                 costs[
+#                     reference_index
+#                 ][
+#                     hypothesis_index
+#                 ] = costs[
+#                     reference_index - 1
+#                 ][
+#                     hypothesis_index - 1
+#                 ]
 
-                operations[
-                    reference_index
-                ][
-                    hypothesis_index
-                ] = "match"
+#                 operations[
+#                     reference_index
+#                 ][
+#                     hypothesis_index
+#                 ] = "match"
 
-                continue
+#                 continue
 
-            substitution_cost = (
-                costs[
-                    reference_index - 1
-                ][
-                    hypothesis_index - 1
-                ]
-                + 1
-            )
+#             substitution_cost = (
+#                 costs[
+#                     reference_index - 1
+#                 ][
+#                     hypothesis_index - 1
+#                 ]
+#                 + 1
+#             )
 
-            deletion_cost = (
-                costs[
-                    reference_index - 1
-                ][
-                    hypothesis_index
-                ]
-                + 1
-            )
+#             deletion_cost = (
+#                 costs[
+#                     reference_index - 1
+#                 ][
+#                     hypothesis_index
+#                 ]
+#                 + 1
+#             )
 
-            insertion_cost = (
-                costs[
-                    reference_index
-                ][
-                    hypothesis_index - 1
-                ]
-                + 1
-            )
+#             insertion_cost = (
+#                 costs[
+#                     reference_index
+#                 ][
+#                     hypothesis_index - 1
+#                 ]
+#                 + 1
+#             )
 
-            minimum_cost = min(
-                substitution_cost,
-                deletion_cost,
-                insertion_cost,
-            )
+#             minimum_cost = min(
+#                 substitution_cost,
+#                 deletion_cost,
+#                 insertion_cost,
+#             )
 
-            costs[
-                reference_index
-            ][
-                hypothesis_index
-            ] = minimum_cost
+#             costs[
+#                 reference_index
+#             ][
+#                 hypothesis_index
+#             ] = minimum_cost
 
-            if (
-                minimum_cost
-                == substitution_cost
-            ):
-                operations[
-                    reference_index
-                ][
-                    hypothesis_index
-                ] = "substitute"
+#             if (
+#                 minimum_cost
+#                 == substitution_cost
+#             ):
+#                 operations[
+#                     reference_index
+#                 ][
+#                     hypothesis_index
+#                 ] = "substitute"
 
-            elif (
-                minimum_cost
-                == deletion_cost
-            ):
-                operations[
-                    reference_index
-                ][
-                    hypothesis_index
-                ] = "delete"
+#             elif (
+#                 minimum_cost
+#                 == deletion_cost
+#             ):
+#                 operations[
+#                     reference_index
+#                 ][
+#                     hypothesis_index
+#                 ] = "delete"
 
-            else:
-                operations[
-                    reference_index
-                ][
-                    hypothesis_index
-                ] = "insert"
+#             else:
+#                 operations[
+#                     reference_index
+#                 ][
+#                     hypothesis_index
+#                 ] = "insert"
 
-    alignment = []
+#     alignment = []
 
-    reference_index = reference_length
-    hypothesis_index = hypothesis_length
+#     reference_index = reference_length
+#     hypothesis_index = hypothesis_length
 
-    while (
-        reference_index > 0
-        or hypothesis_index > 0
-    ):
-        operation = operations[
-            reference_index
-        ][
-            hypothesis_index
-        ]
+#     while (
+#         reference_index > 0
+#         or hypothesis_index > 0
+#     ):
+#         operation = operations[
+#             reference_index
+#         ][
+#             hypothesis_index
+#         ]
 
-        if operation == "match":
-            alignment.append(
-                {
-                    "operation": "match",
-                    "reference_index": (
-                        reference_index - 1
-                    ),
-                    "hypothesis_index": (
-                        hypothesis_index - 1
-                    ),
-                    "target_phoneme": reference[
-                        reference_index - 1
-                    ],
-                    "predicted_phoneme": hypothesis[
-                        hypothesis_index - 1
-                    ],
-                }
-            )
+#         if operation == "match":
+#             alignment.append(
+#                 {
+#                     "operation": "match",
+#                     "reference_index": (
+#                         reference_index - 1
+#                     ),
+#                     "hypothesis_index": (
+#                         hypothesis_index - 1
+#                     ),
+#                     "target_phoneme": reference[
+#                         reference_index - 1
+#                     ],
+#                     "predicted_phoneme": hypothesis[
+#                         hypothesis_index - 1
+#                     ],
+#                 }
+#             )
 
-            reference_index -= 1
-            hypothesis_index -= 1
+#             reference_index -= 1
+#             hypothesis_index -= 1
 
-        elif operation == "substitute":
-            alignment.append(
-                {
-                    "operation": "substitute",
-                    "reference_index": (
-                        reference_index - 1
-                    ),
-                    "hypothesis_index": (
-                        hypothesis_index - 1
-                    ),
-                    "target_phoneme": reference[
-                        reference_index - 1
-                    ],
-                    "predicted_phoneme": hypothesis[
-                        hypothesis_index - 1
-                    ],
-                }
-            )
+#         elif operation == "substitute":
+#             alignment.append(
+#                 {
+#                     "operation": "substitute",
+#                     "reference_index": (
+#                         reference_index - 1
+#                     ),
+#                     "hypothesis_index": (
+#                         hypothesis_index - 1
+#                     ),
+#                     "target_phoneme": reference[
+#                         reference_index - 1
+#                     ],
+#                     "predicted_phoneme": hypothesis[
+#                         hypothesis_index - 1
+#                     ],
+#                 }
+#             )
 
-            reference_index -= 1
-            hypothesis_index -= 1
+#             reference_index -= 1
+#             hypothesis_index -= 1
 
-        elif operation == "delete":
-            alignment.append(
-                {
-                    "operation": "delete",
-                    "reference_index": (
-                        reference_index - 1
-                    ),
-                    "hypothesis_index": None,
-                    "target_phoneme": reference[
-                        reference_index - 1
-                    ],
-                    "predicted_phoneme": None,
-                }
-            )
+#         elif operation == "delete":
+#             alignment.append(
+#                 {
+#                     "operation": "delete",
+#                     "reference_index": (
+#                         reference_index - 1
+#                     ),
+#                     "hypothesis_index": None,
+#                     "target_phoneme": reference[
+#                         reference_index - 1
+#                     ],
+#                     "predicted_phoneme": None,
+#                 }
+#             )
 
-            reference_index -= 1
+#             reference_index -= 1
 
-        elif operation == "insert":
-            alignment.append(
-                {
-                    "operation": "insert",
-                    "reference_index": None,
-                    "hypothesis_index": (
-                        hypothesis_index - 1
-                    ),
-                    "target_phoneme": None,
-                    "predicted_phoneme": hypothesis[
-                        hypothesis_index - 1
-                    ],
-                }
-            )
+#         elif operation == "insert":
+#             alignment.append(
+#                 {
+#                     "operation": "insert",
+#                     "reference_index": None,
+#                     "hypothesis_index": (
+#                         hypothesis_index - 1
+#                     ),
+#                     "target_phoneme": None,
+#                     "predicted_phoneme": hypothesis[
+#                         hypothesis_index - 1
+#                     ],
+#                 }
+#             )
 
-            hypothesis_index -= 1
+#             hypothesis_index -= 1
 
-        else:
-            raise RuntimeError(
-                "Invalid Levenshtein operation "
-                f"at ({reference_index}, "
-                f"{hypothesis_index})"
-            )
+#         else:
+#             raise RuntimeError(
+#                 "Invalid Levenshtein operation "
+#                 f"at ({reference_index}, "
+#                 f"{hypothesis_index})"
+#             )
 
-    alignment.reverse()
+#     alignment.reverse()
 
-    substitutions = sum(
-        item["operation"] == "substitute"
-        for item in alignment
-    )
+#     substitutions = sum(
+#         item["operation"] == "substitute"
+#         for item in alignment
+#     )
 
-    deletions = sum(
-        item["operation"] == "delete"
-        for item in alignment
-    )
+#     deletions = sum(
+#         item["operation"] == "delete"
+#         for item in alignment
+#     )
 
-    insertions = sum(
-        item["operation"] == "insert"
-        for item in alignment
-    )
+#     insertions = sum(
+#         item["operation"] == "insert"
+#         for item in alignment
+#     )
 
-    matches = sum(
-        item["operation"] == "match"
-        for item in alignment
-    )
+#     matches = sum(
+#         item["operation"] == "match"
+#         for item in alignment
+#     )
 
-    return {
-        "alignment": alignment,
-        "matches": matches,
-        "substitutions": substitutions,
-        "deletions": deletions,
-        "insertions": insertions,
-        "total_errors": (
-            substitutions
-            + deletions
-            + insertions
-        ),
-    }
+#     return {
+#         "alignment": alignment,
+#         "matches": matches,
+#         "substitutions": substitutions,
+#         "deletions": deletions,
+#         "insertions": insertions,
+#         "total_errors": (
+#             substitutions
+#             + deletions
+#             + insertions
+#         ),
+#     }
 
 # %%
-def test_external_audio(
-    audio_path,
-    model,
-    accelerator,
-    id_to_phoneme,
-    phoneme_to_id=None,
-    correct_target=None,
-    sample_rate=16000,
-    print_result=True,
-):
-    import ast
-    import torch
-
-    # ============================================================
-    # Parse optional reference target
-    # ============================================================
-
-    if correct_target is not None:
-        if isinstance(correct_target, str):
-            target_text = correct_target.strip()
-
-            if target_text.startswith("["):
-                correct_target = ast.literal_eval(
-                    target_text
-                )
-            else:
-                correct_target = (
-                    target_text.split()
-                )
-
-        if not isinstance(
-            correct_target,
-            (list, tuple),
-        ):
-            raise TypeError(
-                "correct_target must be None, "
-                "a list of phonemes, or a string"
-            )
-
-        correct_target = list(
-            correct_target
-        )
-
-        if len(correct_target) == 0:
-            raise ValueError(
-                "correct_target cannot be empty "
-                "when it is provided"
-            )
-
-        if phoneme_to_id is not None:
-            unknown_phonemes = [
-                phoneme
-                for phoneme in correct_target
-                if phoneme not in phoneme_to_id
-            ]
-
-            if unknown_phonemes:
-                raise ValueError(
-                    f"Unknown phonemes: "
-                    f"{unknown_phonemes}"
-                )
-
-    # ============================================================
-    # Load audio
-    # ============================================================
-
-    waveform = load_waveform(
-        audio_path=audio_path,
-        sr=sample_rate,
-        training=False,
-    )
-
-    original_num_samples = int(
-        waveform.shape[0]
-    )
-
-    audio_duration_seconds = (
-        original_num_samples
-        / sample_rate
-    )
-
-    waveform_batch = (
-        waveform
-        .unsqueeze(0)
-        .to(accelerator.device)
-    )
-
-    input_lengths = torch.tensor(
-        [original_num_samples],
-        dtype=torch.long,
-        device=accelerator.device,
-    )
-
-    # ============================================================
-    # Autonomous inference
-    # ============================================================
-
-    model.eval()
-
-    with torch.inference_mode():
-        with accelerator.autocast():
-            (
-                logits_batch,
-                segment_lengths,
-                hard_boundaries_batch,
-                hidden_lengths,
-                raw_predicted_counts,
-                predicted_lengths,
-            ) = model(
-                waveform_batch,
-                input_lengths,
-            )
-
-    # Important:
-    # no target length was passed into the model.
-
-    logits = logits_batch[0].float()
-
-    probabilities = torch.softmax(
-        logits,
-        dim=-1,
-    )
-
-    (
-        predicted_confidences,
-        predicted_ids,
-    ) = probabilities.max(
-        dim=-1
-    )
-
-    predicted_ids = (
-        predicted_ids
-        .detach()
-        .cpu()
-    )
-
-    predicted_confidences = (
-        predicted_confidences
-        .detach()
-        .cpu()
-    )
-
-    hard_boundaries = (
-        hard_boundaries_batch[0]
-        .detach()
-        .cpu()
-    )
-
-    soft_segment_masses = (
-        segment_lengths[0]
-        .detach()
-        .cpu()
-    )
-
-    hidden_length = int(
-        hidden_lengths[0].item()
-    )
-
-    raw_predicted_count = float(
-        raw_predicted_counts[0]
-        .float()
-        .item()
-    )
-
-    predicted_count = int(
-        predicted_lengths[0].item()
-    )
-
-    actual_output_count = int(
-        predicted_ids.shape[0]
-    )
-
-    if actual_output_count != predicted_count:
-        raise RuntimeError(
-            "The predicted length does not match "
-            "the number of output segments: "
-            f"{predicted_count} versus "
-            f"{actual_output_count}"
-        )
-
-    predicted_phonemes = [
-        id_to_phoneme[
-            int(phoneme_id.item())
-        ]
-        for phoneme_id in predicted_ids
-    ]
-
-    # ============================================================
-    # Convert boundaries to time
-    # ============================================================
-
-    unwrapped_model = (
-        accelerator.unwrap_model(model)
-    )
-
-    boundary_data = (
-        unwrapped_model.boundaries_to_seconds(
-            boundaries=hard_boundaries,
-            input_length=original_num_samples,
-            hidden_length=hidden_length,
-            sample_rate=sample_rate,
-        )
-    )
-
-    total_stride = 1
-
-    for stride in unwrapped_model.conv_stride:
-        total_stride *= stride
-
-    nominal_frame_duration_seconds = (
-        total_stride / sample_rate
-    )
-
-    # ============================================================
-    # Build predicted segment information
-    # ============================================================
-
-    results = []
-
-    for index in range(
-        predicted_count
-    ):
-        predicted_id = int(
-            predicted_ids[index].item()
-        )
-
-        predicted_phoneme = (
-            id_to_phoneme[predicted_id]
-        )
-
-        boundary = boundary_data[index]
-
-        start_frame = int(
-            boundary["start_frame"]
-        )
-
-        end_frame = int(
-            boundary["end_frame"]
-        )
-
-        frame_count = (
-            end_frame - start_frame
-        )
-
-        segment_duration = float(
-            boundary["duration_seconds"]
-        )
-
-        if frame_count > 0:
-            average_frame_duration = (
-                segment_duration
-                / frame_count
-            )
-        else:
-            average_frame_duration = 0.0
-
-        result = {
-            "index": index,
-            "predicted_id": predicted_id,
-            "predicted_phoneme": (
-                predicted_phoneme
-            ),
-            "confidence": float(
-                predicted_confidences[
-                    index
-                ].item()
-            ),
-            "start_frame": start_frame,
-            "end_frame": end_frame,
-            "frame_count": frame_count,
-            "start_sample": int(
-                boundary["start_sample"]
-            ),
-            "end_sample": int(
-                boundary["end_sample"]
-            ),
-            "start_seconds": float(
-                boundary["start_seconds"]
-            ),
-            "end_seconds": float(
-                boundary["end_seconds"]
-            ),
-            "duration_seconds": (
-                segment_duration
-            ),
-            "average_frame_duration_seconds": (
-                average_frame_duration
-            ),
-            "nominal_frame_duration_seconds": (
-                nominal_frame_duration_seconds
-            ),
-            "soft_segment_mass": float(
-                soft_segment_masses[
-                    index
-                ].item()
-            ),
-
-            # Filled only when correct_target
-            # is provided.
-            "target_phoneme": None,
-            "alignment_operation": None,
-            "correct": None,
-        }
-
-        results.append(result)
-
-    # ============================================================
-    # Optional reference evaluation
-    # ============================================================
-
-    evaluation = None
-    alignment = None
-
-    if correct_target is not None:
-        alignment_result = (
-            align_phoneme_sequences(
-                reference=correct_target,
-                hypothesis=(
-                    predicted_phonemes
-                ),
-            )
-        )
-
-        alignment = alignment_result[
-            "alignment"
-        ]
-
-        matches = alignment_result[
-            "matches"
-        ]
-
-        substitutions = alignment_result[
-            "substitutions"
-        ]
-
-        deletions = alignment_result[
-            "deletions"
-        ]
-
-        insertions = alignment_result[
-            "insertions"
-        ]
-
-        total_errors = alignment_result[
-            "total_errors"
-        ]
-
-        reference_count = len(
-            correct_target
-        )
-
-        alignment_length = (
-            matches
-            + substitutions
-            + deletions
-            + insertions
-        )
-
-        phoneme_error_rate = (
-            total_errors
-            / reference_count
-        )
-
-        reference_match_accuracy = (
-            matches
-            / reference_count
-        )
-
-        alignment_accuracy = (
-            matches
-            / max(
-                alignment_length,
-                1,
-            )
-        )
-
-        exact_sequence = (
-            total_errors == 0
-        )
-
-        count_error = abs(
-            predicted_count
-            - reference_count
-        )
-
-        evaluation = {
-            "reference_count": (
-                reference_count
-            ),
-            "predicted_count": (
-                predicted_count
-            ),
-            "count_error": count_error,
-            "count_is_exact": (
-                count_error == 0
-            ),
-            "matches": matches,
-            "substitutions": (
-                substitutions
-            ),
-            "deletions": deletions,
-            "insertions": insertions,
-            "total_errors": (
-                total_errors
-            ),
-            "phoneme_error_rate": (
-                phoneme_error_rate
-            ),
-            "reference_match_accuracy": (
-                reference_match_accuracy
-            ),
-            "alignment_accuracy": (
-                alignment_accuracy
-            ),
-            "exact_sequence": (
-                exact_sequence
-            ),
-        }
-
-        # Attach alignment results to the
-        # corresponding predicted segment.
-        for alignment_item in alignment:
-            hypothesis_index = (
-                alignment_item[
-                    "hypothesis_index"
-                ]
-            )
-
-            if hypothesis_index is None:
-                # Deletion has no predicted
-                # segment and therefore no boundary.
-                continue
-
-            results[
-                hypothesis_index
-            ][
-                "target_phoneme"
-            ] = alignment_item[
-                "target_phoneme"
-            ]
-
-            results[
-                hypothesis_index
-            ][
-                "alignment_operation"
-            ] = alignment_item[
-                "operation"
-            ]
-
-            results[
-                hypothesis_index
-            ][
-                "correct"
-            ] = (
-                alignment_item["operation"]
-                == "match"
-            )
-
-    # ============================================================
-    # Final output
-    # ============================================================
-
-    output = {
-        "audio_path": audio_path,
-        "sample_rate": sample_rate,
-        "audio_samples": (
-            original_num_samples
-        ),
-        "audio_duration_seconds": (
-            audio_duration_seconds
-        ),
-        "encoder_frame_count": (
-            hidden_length
-        ),
-        "nominal_frame_duration_seconds": (
-            nominal_frame_duration_seconds
-        ),
-        "raw_predicted_count": (
-            raw_predicted_count
-        ),
-        "predicted_count": (
-            predicted_count
-        ),
-        "predicted_phonemes": (
-            predicted_phonemes
-        ),
-        "correct_target": (
-            correct_target
-        ),
-        "evaluation": evaluation,
-        "alignment": alignment,
-        "segments": results,
-    }
-
-    # ============================================================
-    # Print
-    # ============================================================
-
-    if print_result:
-        print()
-        print(
-            f"Audio: {audio_path}"
-        )
-
-        print(
-            f"Audio duration: "
-            f"{audio_duration_seconds:.3f} seconds"
-        )
-
-        print(
-            f"Encoder frames: "
-            f"{hidden_length}"
-        )
-
-        print(
-            f"Raw predicted count: "
-            f"{raw_predicted_count:.3f}"
-        )
-
-        print(
-            f"Selected phoneme count: "
-            f"{predicted_count}"
-        )
-
-        print(
-            f"Nominal frame duration: "
-            f"{nominal_frame_duration_seconds * 1000:.2f} ms"
-        )
-
-        if evaluation is not None:
-            print()
-            print("Reference evaluation")
-
-            print(
-                f"Target count: "
-                f"{evaluation['reference_count']}"
-            )
-
-            print(
-                f"Count error: "
-                f"{evaluation['count_error']}"
-            )
-
-            print(
-                f"Matches: "
-                f"{evaluation['matches']}"
-            )
-
-            print(
-                f"Substitutions: "
-                f"{evaluation['substitutions']}"
-            )
-
-            print(
-                f"Deletions: "
-                f"{evaluation['deletions']}"
-            )
-
-            print(
-                f"Insertions: "
-                f"{evaluation['insertions']}"
-            )
-
-            print(
-                f"Phoneme error rate: "
-                f"{evaluation['phoneme_error_rate']:.2%}"
-            )
-
-            print(
-                f"Reference match accuracy: "
-                f"{evaluation['reference_match_accuracy']:.2%}"
-            )
-
-            print(
-                f"Alignment accuracy: "
-                f"{evaluation['alignment_accuracy']:.2%}"
-            )
-
-            print(
-                f"Exact sequence: "
-                f"{evaluation['exact_sequence']}"
-            )
-
-        print()
-        print(
-            "Predicted phoneme boundaries"
-        )
-
-        print("=" * 145)
-
-        for result in results:
-            if evaluation is None:
-                alignment_text = (
-                    "not evaluated"
-                )
-
-                target_text = "-"
-            else:
-                alignment_text = (
-                    result[
-                        "alignment_operation"
-                    ]
-                    or "insertion"
-                )
-
-                target_text = (
-                    result["target_phoneme"]
-                    if result["target_phoneme"]
-                    is not None
-                    else "-"
-                )
-
-            print(
-                f"{result['index']:03d} | "
-                f"target={target_text:<9} | "
-                f"pred={result['predicted_phoneme']:<9} | "
-                f"{alignment_text:<11} | "
-                f"confidence={result['confidence']:.3f} | "
-                f"frames=["
-                f"{result['start_frame']:4d}, "
-                f"{result['end_frame']:4d}) | "
-                f"count={result['frame_count']:3d} | "
-                f"time=["
-                f"{result['start_seconds']:7.3f}, "
-                f"{result['end_seconds']:7.3f}) s | "
-                f"duration="
-                f"{result['duration_seconds']:6.3f} s | "
-                f"soft_mass="
-                f"{result['soft_segment_mass']:6.2f}"
-            )
-
-        print("=" * 145)
-
-        if (
-            evaluation is not None
-            and evaluation["deletions"] > 0
-        ):
-            print()
-            print(
-                "Deleted target phonemes:"
-            )
-
-            for alignment_item in alignment:
-                if (
-                    alignment_item[
-                        "operation"
-                    ]
-                    == "delete"
-                ):
-                    print(
-                        f"target index "
-                        f"{alignment_item['reference_index']:03d} | "
-                        f"phoneme="
-                        f"{alignment_item['target_phoneme']}"
-                    )
-
-        if correct_target is not None:
-            print()
-            print("Correct target:")
-            print(correct_target)
-
-        print()
-        print("Predicted phonemes:")
-        print(predicted_phonemes)
-
-    return output
+# def test_external_audio(
+#     audio_path,
+#     model,
+#     accelerator,
+#     id_to_phoneme,
+#     phoneme_to_id=None,
+#     correct_target=None,
+#     sample_rate=16000,
+#     print_result=True,
+# ):
+#     import ast
+#     import torch
+
+#     # ============================================================
+#     # Parse optional reference target
+#     # ============================================================
+
+#     if correct_target is not None:
+#         if isinstance(correct_target, str):
+#             target_text = correct_target.strip()
+
+#             if target_text.startswith("["):
+#                 correct_target = ast.literal_eval(
+#                     target_text
+#                 )
+#             else:
+#                 correct_target = (
+#                     target_text.split()
+#                 )
+
+#         if not isinstance(
+#             correct_target,
+#             (list, tuple),
+#         ):
+#             raise TypeError(
+#                 "correct_target must be None, "
+#                 "a list of phonemes, or a string"
+#             )
+
+#         correct_target = list(
+#             correct_target
+#         )
+
+#         if len(correct_target) == 0:
+#             raise ValueError(
+#                 "correct_target cannot be empty "
+#                 "when it is provided"
+#             )
+
+#         if phoneme_to_id is not None:
+#             unknown_phonemes = [
+#                 phoneme
+#                 for phoneme in correct_target
+#                 if phoneme not in phoneme_to_id
+#             ]
+
+#             if unknown_phonemes:
+#                 raise ValueError(
+#                     f"Unknown phonemes: "
+#                     f"{unknown_phonemes}"
+#                 )
+
+#     # ============================================================
+#     # Load audio
+#     # ============================================================
+
+#     waveform = load_waveform(
+#         audio_path=audio_path,
+#         sr=sample_rate,
+#         training=False,
+#     )
+
+#     original_num_samples = int(
+#         waveform.shape[0]
+#     )
+
+#     audio_duration_seconds = (
+#         original_num_samples
+#         / sample_rate
+#     )
+
+#     waveform_batch = (
+#         waveform
+#         .unsqueeze(0)
+#         .to(accelerator.device)
+#     )
+
+#     input_lengths = torch.tensor(
+#         [original_num_samples],
+#         dtype=torch.long,
+#         device=accelerator.device,
+#     )
+
+#     # ============================================================
+#     # Autonomous inference
+#     # ============================================================
+
+#     model.eval()
+
+#     with torch.inference_mode():
+#         with accelerator.autocast():
+#             (
+#                 logits_batch,
+#                 segment_lengths,
+#                 hard_boundaries_batch,
+#                 hidden_lengths,
+#                 raw_predicted_counts,
+#                 predicted_lengths,
+#             ) = model(
+#                 waveform_batch,
+#                 input_lengths,
+#             )
+
+#     # Important:
+#     # no target length was passed into the model.
+
+#     logits = logits_batch[0].float()
+
+#     probabilities = torch.softmax(
+#         logits,
+#         dim=-1,
+#     )
+
+#     (
+#         predicted_confidences,
+#         predicted_ids,
+#     ) = probabilities.max(
+#         dim=-1
+#     )
+
+#     predicted_ids = (
+#         predicted_ids
+#         .detach()
+#         .cpu()
+#     )
+
+#     predicted_confidences = (
+#         predicted_confidences
+#         .detach()
+#         .cpu()
+#     )
+
+#     hard_boundaries = (
+#         hard_boundaries_batch[0]
+#         .detach()
+#         .cpu()
+#     )
+
+#     soft_segment_masses = (
+#         segment_lengths[0]
+#         .detach()
+#         .cpu()
+#     )
+
+#     hidden_length = int(
+#         hidden_lengths[0].item()
+#     )
+
+#     raw_predicted_count = float(
+#         raw_predicted_counts[0]
+#         .float()
+#         .item()
+#     )
+
+#     predicted_count = int(
+#         predicted_lengths[0].item()
+#     )
+
+#     actual_output_count = int(
+#         predicted_ids.shape[0]
+#     )
+
+#     if actual_output_count != predicted_count:
+#         raise RuntimeError(
+#             "The predicted length does not match "
+#             "the number of output segments: "
+#             f"{predicted_count} versus "
+#             f"{actual_output_count}"
+#         )
+
+#     predicted_phonemes = [
+#         id_to_phoneme[
+#             int(phoneme_id.item())
+#         ]
+#         for phoneme_id in predicted_ids
+#     ]
+
+#     # ============================================================
+#     # Convert boundaries to time
+#     # ============================================================
+
+#     unwrapped_model = (
+#         accelerator.unwrap_model(model)
+#     )
+
+#     boundary_data = (
+#         unwrapped_model.boundaries_to_seconds(
+#             boundaries=hard_boundaries,
+#             input_length=original_num_samples,
+#             hidden_length=hidden_length,
+#             sample_rate=sample_rate,
+#         )
+#     )
+
+#     total_stride = 1
+
+#     for stride in unwrapped_model.conv_stride:
+#         total_stride *= stride
+
+#     nominal_frame_duration_seconds = (
+#         total_stride / sample_rate
+#     )
+
+#     # ============================================================
+#     # Build predicted segment information
+#     # ============================================================
+
+#     results = []
+
+#     for index in range(
+#         predicted_count
+#     ):
+#         predicted_id = int(
+#             predicted_ids[index].item()
+#         )
+
+#         predicted_phoneme = (
+#             id_to_phoneme[predicted_id]
+#         )
+
+#         boundary = boundary_data[index]
+
+#         start_frame = int(
+#             boundary["start_frame"]
+#         )
+
+#         end_frame = int(
+#             boundary["end_frame"]
+#         )
+
+#         frame_count = (
+#             end_frame - start_frame
+#         )
+
+#         segment_duration = float(
+#             boundary["duration_seconds"]
+#         )
+
+#         if frame_count > 0:
+#             average_frame_duration = (
+#                 segment_duration
+#                 / frame_count
+#             )
+#         else:
+#             average_frame_duration = 0.0
+
+#         result = {
+#             "index": index,
+#             "predicted_id": predicted_id,
+#             "predicted_phoneme": (
+#                 predicted_phoneme
+#             ),
+#             "confidence": float(
+#                 predicted_confidences[
+#                     index
+#                 ].item()
+#             ),
+#             "start_frame": start_frame,
+#             "end_frame": end_frame,
+#             "frame_count": frame_count,
+#             "start_sample": int(
+#                 boundary["start_sample"]
+#             ),
+#             "end_sample": int(
+#                 boundary["end_sample"]
+#             ),
+#             "start_seconds": float(
+#                 boundary["start_seconds"]
+#             ),
+#             "end_seconds": float(
+#                 boundary["end_seconds"]
+#             ),
+#             "duration_seconds": (
+#                 segment_duration
+#             ),
+#             "average_frame_duration_seconds": (
+#                 average_frame_duration
+#             ),
+#             "nominal_frame_duration_seconds": (
+#                 nominal_frame_duration_seconds
+#             ),
+#             "soft_segment_mass": float(
+#                 soft_segment_masses[
+#                     index
+#                 ].item()
+#             ),
+
+#             # Filled only when correct_target
+#             # is provided.
+#             "target_phoneme": None,
+#             "alignment_operation": None,
+#             "correct": None,
+#         }
+
+#         results.append(result)
+
+#     # ============================================================
+#     # Optional reference evaluation
+#     # ============================================================
+
+#     evaluation = None
+#     alignment = None
+
+#     if correct_target is not None:
+#         alignment_result = (
+#             align_phoneme_sequences(
+#                 reference=correct_target,
+#                 hypothesis=(
+#                     predicted_phonemes
+#                 ),
+#             )
+#         )
+
+#         alignment = alignment_result[
+#             "alignment"
+#         ]
+
+#         matches = alignment_result[
+#             "matches"
+#         ]
+
+#         substitutions = alignment_result[
+#             "substitutions"
+#         ]
+
+#         deletions = alignment_result[
+#             "deletions"
+#         ]
+
+#         insertions = alignment_result[
+#             "insertions"
+#         ]
+
+#         total_errors = alignment_result[
+#             "total_errors"
+#         ]
+
+#         reference_count = len(
+#             correct_target
+#         )
+
+#         alignment_length = (
+#             matches
+#             + substitutions
+#             + deletions
+#             + insertions
+#         )
+
+#         phoneme_error_rate = (
+#             total_errors
+#             / reference_count
+#         )
+
+#         reference_match_accuracy = (
+#             matches
+#             / reference_count
+#         )
+
+#         alignment_accuracy = (
+#             matches
+#             / max(
+#                 alignment_length,
+#                 1,
+#             )
+#         )
+
+#         exact_sequence = (
+#             total_errors == 0
+#         )
+
+#         count_error = abs(
+#             predicted_count
+#             - reference_count
+#         )
+
+#         evaluation = {
+#             "reference_count": (
+#                 reference_count
+#             ),
+#             "predicted_count": (
+#                 predicted_count
+#             ),
+#             "count_error": count_error,
+#             "count_is_exact": (
+#                 count_error == 0
+#             ),
+#             "matches": matches,
+#             "substitutions": (
+#                 substitutions
+#             ),
+#             "deletions": deletions,
+#             "insertions": insertions,
+#             "total_errors": (
+#                 total_errors
+#             ),
+#             "phoneme_error_rate": (
+#                 phoneme_error_rate
+#             ),
+#             "reference_match_accuracy": (
+#                 reference_match_accuracy
+#             ),
+#             "alignment_accuracy": (
+#                 alignment_accuracy
+#             ),
+#             "exact_sequence": (
+#                 exact_sequence
+#             ),
+#         }
+
+#         # Attach alignment results to the
+#         # corresponding predicted segment.
+#         for alignment_item in alignment:
+#             hypothesis_index = (
+#                 alignment_item[
+#                     "hypothesis_index"
+#                 ]
+#             )
+
+#             if hypothesis_index is None:
+#                 # Deletion has no predicted
+#                 # segment and therefore no boundary.
+#                 continue
+
+#             results[
+#                 hypothesis_index
+#             ][
+#                 "target_phoneme"
+#             ] = alignment_item[
+#                 "target_phoneme"
+#             ]
+
+#             results[
+#                 hypothesis_index
+#             ][
+#                 "alignment_operation"
+#             ] = alignment_item[
+#                 "operation"
+#             ]
+
+#             results[
+#                 hypothesis_index
+#             ][
+#                 "correct"
+#             ] = (
+#                 alignment_item["operation"]
+#                 == "match"
+#             )
+
+#     # ============================================================
+#     # Final output
+#     # ============================================================
+
+#     output = {
+#         "audio_path": audio_path,
+#         "sample_rate": sample_rate,
+#         "audio_samples": (
+#             original_num_samples
+#         ),
+#         "audio_duration_seconds": (
+#             audio_duration_seconds
+#         ),
+#         "encoder_frame_count": (
+#             hidden_length
+#         ),
+#         "nominal_frame_duration_seconds": (
+#             nominal_frame_duration_seconds
+#         ),
+#         "raw_predicted_count": (
+#             raw_predicted_count
+#         ),
+#         "predicted_count": (
+#             predicted_count
+#         ),
+#         "predicted_phonemes": (
+#             predicted_phonemes
+#         ),
+#         "correct_target": (
+#             correct_target
+#         ),
+#         "evaluation": evaluation,
+#         "alignment": alignment,
+#         "segments": results,
+#     }
+
+#     # ============================================================
+#     # Print
+#     # ============================================================
+
+#     if print_result:
+#         print()
+#         print(
+#             f"Audio: {audio_path}"
+#         )
+
+#         print(
+#             f"Audio duration: "
+#             f"{audio_duration_seconds:.3f} seconds"
+#         )
+
+#         print(
+#             f"Encoder frames: "
+#             f"{hidden_length}"
+#         )
+
+#         print(
+#             f"Raw predicted count: "
+#             f"{raw_predicted_count:.3f}"
+#         )
+
+#         print(
+#             f"Selected phoneme count: "
+#             f"{predicted_count}"
+#         )
+
+#         print(
+#             f"Nominal frame duration: "
+#             f"{nominal_frame_duration_seconds * 1000:.2f} ms"
+#         )
+
+#         if evaluation is not None:
+#             print()
+#             print("Reference evaluation")
+
+#             print(
+#                 f"Target count: "
+#                 f"{evaluation['reference_count']}"
+#             )
+
+#             print(
+#                 f"Count error: "
+#                 f"{evaluation['count_error']}"
+#             )
+
+#             print(
+#                 f"Matches: "
+#                 f"{evaluation['matches']}"
+#             )
+
+#             print(
+#                 f"Substitutions: "
+#                 f"{evaluation['substitutions']}"
+#             )
+
+#             print(
+#                 f"Deletions: "
+#                 f"{evaluation['deletions']}"
+#             )
+
+#             print(
+#                 f"Insertions: "
+#                 f"{evaluation['insertions']}"
+#             )
+
+#             print(
+#                 f"Phoneme error rate: "
+#                 f"{evaluation['phoneme_error_rate']:.2%}"
+#             )
+
+#             print(
+#                 f"Reference match accuracy: "
+#                 f"{evaluation['reference_match_accuracy']:.2%}"
+#             )
+
+#             print(
+#                 f"Alignment accuracy: "
+#                 f"{evaluation['alignment_accuracy']:.2%}"
+#             )
+
+#             print(
+#                 f"Exact sequence: "
+#                 f"{evaluation['exact_sequence']}"
+#             )
+
+#         print()
+#         print(
+#             "Predicted phoneme boundaries"
+#         )
+
+#         print("=" * 145)
+
+#         for result in results:
+#             if evaluation is None:
+#                 alignment_text = (
+#                     "not evaluated"
+#                 )
+
+#                 target_text = "-"
+#             else:
+#                 alignment_text = (
+#                     result[
+#                         "alignment_operation"
+#                     ]
+#                     or "insertion"
+#                 )
+
+#                 target_text = (
+#                     result["target_phoneme"]
+#                     if result["target_phoneme"]
+#                     is not None
+#                     else "-"
+#                 )
+
+#             print(
+#                 f"{result['index']:03d} | "
+#                 f"target={target_text:<9} | "
+#                 f"pred={result['predicted_phoneme']:<9} | "
+#                 f"{alignment_text:<11} | "
+#                 f"confidence={result['confidence']:.3f} | "
+#                 f"frames=["
+#                 f"{result['start_frame']:4d}, "
+#                 f"{result['end_frame']:4d}) | "
+#                 f"count={result['frame_count']:3d} | "
+#                 f"time=["
+#                 f"{result['start_seconds']:7.3f}, "
+#                 f"{result['end_seconds']:7.3f}) s | "
+#                 f"duration="
+#                 f"{result['duration_seconds']:6.3f} s | "
+#                 f"soft_mass="
+#                 f"{result['soft_segment_mass']:6.2f}"
+#             )
+
+#         print("=" * 145)
+
+#         if (
+#             evaluation is not None
+#             and evaluation["deletions"] > 0
+#         ):
+#             print()
+#             print(
+#                 "Deleted target phonemes:"
+#             )
+
+#             for alignment_item in alignment:
+#                 if (
+#                     alignment_item[
+#                         "operation"
+#                     ]
+#                     == "delete"
+#                 ):
+#                     print(
+#                         f"target index "
+#                         f"{alignment_item['reference_index']:03d} | "
+#                         f"phoneme="
+#                         f"{alignment_item['target_phoneme']}"
+#                     )
+
+#         if correct_target is not None:
+#             print()
+#             print("Correct target:")
+#             print(correct_target)
+
+#         print()
+#         print("Predicted phonemes:")
+#         print(predicted_phonemes)
+
+#     return output
 
 # %%
 # import numpy as np
@@ -3360,28 +4312,28 @@ def test_external_audio(
 # print(f"Saved {audio_path}")
 
 # %%
-item = val_df.iloc[1]
-audio_path =  f"../../datasets/Quran_ds/Quran_ds/audio/audio/{item['path_of_audio']}"
-target_phonemes = ast.literal_eval(item['phonemes'])
+# item = val_df.iloc[1]
+# audio_path =  f"../../datasets/Quran_ds/Quran_ds/audio/audio/{item['path_of_audio']}"
+# target_phonemes = ast.literal_eval(item['phonemes'])
 
 
-# audio_path =  "../../datasets/test_audios/1.wav"
+# # audio_path =  "../../datasets/test_audios/1.wav"
 
-# audio_path = "../../datasets/QDAT_Quran_DS/FINAL SOUND/FINAL SOUND/S10_1.wav"
 
-# target_phonemes =['qaa', 'luu', 'su', 'bK', 'ħaa', 'na', 'ka', 'laa', 'ʕi', 'l', 'ma', 'la', 'naa', 'ʔi', 'l', 'laa', 'maa', 'ʕa', 'l', 'la', 'm', 'ta', 'naa', 'ʔi', 'nn', 'na', 'ka', 'ʔa', 'nt', 'ta', 'l', 'ʕa', 'lii', 'mu', 'l', 'ħa', 'kii', 'm']
+# # audio_path = "../../datasets/QDAT_Quran_DS/FINAL SOUND/FINAL SOUND/S10_1.wav"
+# # target_phonemes =['qaa', 'luu', 'su', 'bK', 'ħaa', 'na', 'ka', 'laa', 'ʕi', 'l', 'ma', 'la', 'naa', 'ʔi', 'l', 'laa', 'maa', 'ʕa', 'l', 'la', 'm', 'ta', 'naa', 'ʔi', 'nn', 'na', 'ka', 'ʔa', 'nt', 'ta', 'l', 'ʕa', 'lii', 'mu', 'l', 'ħa', 'kii', 'm']
 
-print(f"Audio path: {audio_path}")
-print(f"Target phonemes: {target_phonemes}")
+# print(f"Audio path: {audio_path}")
+# print(f"Target phonemes: {target_phonemes}")
 
 # %%
-output = test_external_audio(
-    audio_path=audio_path,
-    model=model,
-    accelerator=accelerator,
-    id_to_phoneme=id_to_phoneme,
-    phoneme_to_id=phoneme_to_id,
-    correct_target=target_phonemes,
-)
+# output = test_external_audio(
+#     audio_path=audio_path,
+#     model=model,
+#     accelerator=accelerator,
+#     id_to_phoneme=id_to_phoneme,
+#     phoneme_to_id=phoneme_to_id,
+#     correct_target=target_phonemes,
+# )
 
 
