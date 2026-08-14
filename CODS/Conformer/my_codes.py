@@ -27,18 +27,19 @@ from typing import Dict, List
 import os
 import random
 import math
+import time
 
 # %%
 # ? this is for local training
 
-MODEL_PATH = "../../models/best_checkpoint_with_count_head.pth"
+MODEL_PATH = "../../models/best_checkpoint_with_count_head_temp.pth"
 WORKING_MODEL_PATH = "../../models/checkpoint.pth"
 WORKING_BEST_MODEL_PATH = "../../models/best_checkpoint.pth"
 
 DATASET_PATH = "../../datasets/Quran_ds/Quran_ds/audio/audio/"
 DATASET_PATH_1 = "../../datasets/Quran_ds/Quran_ds/audio/audio/"
-TRAIN_DS_PATH = "../../datasets/Quran_ds/quran_train.csv"
-TEST_DS_PATH = "../../datasets/Quran_ds/quran_test.csv"
+TRAIN_DS_PATH = "../../datasets/Quran_ds/train_df.csv"
+TEST_DS_PATH = "../../datasets/Quran_ds/val_df.csv"
 
 
 # ? this is for Kaggle training
@@ -155,8 +156,12 @@ PHONEMES: List[str] = (
 PHONEMES_CTC: List[str] =  PHONEMES
 
 
+
 phoneme_to_id: Dict[str, int] = {p: i for i, p in enumerate(PHONEMES_CTC)}
 id_to_phoneme = {v: k for k, v in phoneme_to_id.items()}
+
+CTC_BLANK_ID = 0
+CTC_VOCAB_SIZE = len(phoneme_to_id) + 1
 
 # %%
 len(phoneme_to_id)
@@ -811,7 +816,7 @@ def load_waveform(
 ):
     signal = None
 
-    # audio_path = audio_path.replace(".wav", ".mp3")
+    audio_path = audio_path.replace(".mp3", ".wav")
 
 
     # ============================================================
@@ -1001,17 +1006,6 @@ def load_waveform(
 class DynamicBatchSampler(
     torch.utils.data.Sampler
 ):
-    """
-    Groups recordings by estimated augmented length.
-
-    The batch budget is:
-
-        batch_size * longest_sample_in_batch
-
-    A recording longer than the batch budget is still
-    included, but placed in a singleton batch.
-    """
-
     def __init__(
         self,
         dataset,
@@ -1031,7 +1025,10 @@ class DynamicBatchSampler(
             minimum_speed_factor
         )
 
-        if self.max_padded_samples_per_batch <= 0:
+        if (
+            self.max_padded_samples_per_batch
+            <= 0
+        ):
             raise ValueError(
                 "max_padded_samples_per_batch "
                 "must be greater than zero"
@@ -1039,8 +1036,8 @@ class DynamicBatchSampler(
 
         if self.minimum_speed_factor <= 0:
             raise ValueError(
-                "minimum_speed_factor must be "
-                "greater than zero"
+                "minimum_speed_factor must "
+                "be greater than zero"
             )
 
         print(
@@ -1057,40 +1054,31 @@ class DynamicBatchSampler(
                 index
             ]
 
-            if row["ds_index"] == 1:
-                audio_path = os.path.join(
-                    dataset.dataset_path,
-                    row["path_of_audio"],
+            duration_seconds = float(
+                row["duration"]
+            )
+
+            if (
+                not np.isfinite(
+                    duration_seconds
                 )
-            else:
-                audio_path = os.path.join(
-                    dataset.dataset_path_1,
-                    row["path_of_audio"],
+                or duration_seconds <= 0
+            ):
+                raise ValueError(
+                    f"Invalid duration at "
+                    f"index {index}: "
+                    f"{duration_seconds}"
                 )
 
-            try:
-                info = torchaudio.info(
-                    audio_path
-                )
+            original_length = int(
+                duration_seconds * SR
+            )
 
-                original_length = int(
-                    info.num_frames
-                    * SR
-                    / info.sample_rate
+            estimated_length = int(
+                np.ceil(
+                    original_length
+                    / self.minimum_speed_factor
                 )
-
-            except Exception:
-                # Conservative fallback:
-                # assume a 10-second recording.
-                original_length = (
-                    SR * 10
-                )
-
-            # Slower speed augmentation produces
-            # a longer waveform.
-            estimated_length = math.ceil(
-                original_length
-                / self.minimum_speed_factor
             )
 
             self.original_lengths.append(
@@ -1101,39 +1089,49 @@ class DynamicBatchSampler(
                 estimated_length
             )
 
-        over_budget_count = sum(
-            length
-            > self.max_padded_samples_per_batch
-            for length in self.estimated_lengths
-        )
-
         longest_original_seconds = (
-            max(self.original_lengths)
+            max(
+                self.original_lengths
+            )
             / SR
         )
 
         longest_estimated_seconds = (
-            max(self.estimated_lengths)
+            max(
+                self.estimated_lengths
+            )
             / SR
+        )
+
+        over_budget_count = sum(
+            length
+            > self.max_padded_samples_per_batch
+            for length in (
+                self.estimated_lengths
+            )
         )
 
         print(
             f"Length index built for "
-            f"{len(self.estimated_lengths)} samples"
+            f"{len(self.estimated_lengths)} "
+            f"samples"
         )
 
         print(
             f"Longest original audio: "
-            f"{longest_original_seconds:.2f} seconds"
+            f"{longest_original_seconds:.2f} "
+            f"seconds"
         )
 
         print(
             f"Longest estimated audio: "
-            f"{longest_estimated_seconds:.2f} seconds"
+            f"{longest_estimated_seconds:.2f} "
+            f"seconds"
         )
 
         print(
-            f"Singleton recordings over budget: "
+            f"Singleton recordings "
+            f"over budget: "
             f"{over_budget_count}"
         )
 
@@ -1148,10 +1146,11 @@ class DynamicBatchSampler(
             )
         )
 
-        # Sorting keeps similar lengths together.
         indices.sort(
             key=lambda index:
-            self.estimated_lengths[index]
+            self.estimated_lengths[
+                index
+            ]
         )
 
         batches = []
@@ -1160,12 +1159,13 @@ class DynamicBatchSampler(
         current_max_length = 0
 
         for index in indices:
-            length = self.estimated_lengths[
-                index
-            ]
 
-            # Explicitly include an oversized recording
-            # as a singleton batch.
+            length = (
+                self.estimated_lengths[
+                    index
+                ]
+            )
+
             if (
                 length
                 > self.max_padded_samples_per_batch
@@ -1190,12 +1190,13 @@ class DynamicBatchSampler(
             )
 
             new_batch_size = (
-                len(current_batch) + 1
+                len(current_batch)
+                + 1
             )
 
             padded_sample_count = (
-                new_batch_size
-                * new_max_length
+                new_max_length
+                * new_batch_size
             )
 
             if (
@@ -1239,9 +1240,9 @@ class DynamicBatchSampler(
     def __iter__(
         self,
     ):
-        batches = self._build_batches()
-
-        for batch in batches:
+        for batch in (
+            self._build_batches()
+        ):
             yield batch
 
     def __len__(
@@ -1331,6 +1332,79 @@ def ctc_collate(batch):
         torch.tensor(input_lengths, dtype=torch.long),
         torch.tensor(target_lengths, dtype=torch.long),
     )
+
+def greedy_ctc_decode(
+    ctc_logits,
+    hidden_lengths,
+):
+    """
+    Convert frame-level CTC logits into
+    phoneme sequences.
+
+    CTC ID:
+        0 = blank
+        1 = original phoneme ID 0
+        2 = original phoneme ID 1
+        ...
+    """
+
+    frame_predictions = torch.argmax(
+        ctc_logits,
+        dim=-1,
+    )
+
+    decoded_batch = []
+
+    for batch_index in range(
+        frame_predictions.shape[0]
+    ):
+        valid_length = int(
+            hidden_lengths[
+                batch_index
+            ].item()
+        )
+
+        frame_ids = (
+            frame_predictions[
+                batch_index,
+                :valid_length,
+            ]
+            .detach()
+            .cpu()
+            .tolist()
+        )
+
+        decoded_ids = []
+
+        previous_id = None
+
+        for ctc_id in frame_ids:
+
+            # CTC collapses consecutive
+            # repeated predictions.
+            if ctc_id == previous_id:
+                continue
+
+            previous_id = ctc_id
+
+            # Remove blank.
+            if ctc_id == CTC_BLANK_ID:
+                continue
+
+            # Convert CTC ID back to the
+            # normal phoneme ID.
+            phoneme_id = ctc_id - 1
+
+            decoded_ids.append(
+                phoneme_id
+            )
+
+        decoded_batch.append(
+            decoded_ids
+        )
+
+    return decoded_batch
+
 
 # %%
 class SpecAugment(nn.Module):
@@ -1423,14 +1497,6 @@ class SegmentationHead(nn.Module):
         return segment_embedding, weights
 
 # %%
-wav2vec2_model = Wav2Vec2Model.from_pretrained(
-    "facebook/wav2vec2-large-xlsr-53", ignore_mismatched_sizes=True,local_files_only=True
-)
-
-for param in wav2vec2_model.parameters():
-    param.requires_grad = True
-
-# %%
 class ASRModel(torch.nn.Module):
 
     def __init__(self, wav2vec2, spec_augment,dropout=0.1):
@@ -1465,11 +1531,9 @@ class ASRModel(torch.nn.Module):
             vocab_size=len(phoneme_to_id),
         )
 
-        self.count_head = nn.Sequential(
-            nn.LayerNorm(1025),
-            nn.Linear(1025, 256),
-            nn.ReLU(),
-            nn.Linear(256, 1),
+        self.ctc_head = nn.Linear(
+            512,
+            CTC_VOCAB_SIZE,
         )
 
         self.spec_augment = spec_augment
@@ -1700,72 +1764,6 @@ class ASRModel(torch.nn.Module):
     
         return output
 
-    def predict_phoneme_count(
-        self,
-        hidden,
-        hidden_lengths,
-    ):
-        B, T, H = hidden.shape
-
-        hidden_float = hidden.float()
-
-        frame_indices = torch.arange(
-            T,
-            device=hidden.device,
-        ).unsqueeze(0)
-
-        valid_mask = (
-            frame_indices
-            < hidden_lengths.unsqueeze(1)
-        )
-
-        valid_mask = valid_mask.unsqueeze(
-            -1
-        ).to(hidden_float.dtype)
-
-        valid_lengths = hidden_lengths.clamp_min(
-            1
-        ).to(hidden_float.dtype).unsqueeze(1)
-
-        hidden_mean = (
-            hidden_float * valid_mask
-        ).sum(dim=1) / valid_lengths
-
-        centered_hidden = (
-            hidden_float
-            - hidden_mean.unsqueeze(1)
-        )
-
-        hidden_variance = (
-            centered_hidden.pow(2)
-            * valid_mask
-        ).sum(dim=1) / valid_lengths
-
-        hidden_std = torch.sqrt(
-            hidden_variance + 1e-5
-        )
-
-        log_hidden_length = torch.log1p(
-            hidden_lengths.to(
-                hidden_float.dtype
-            )
-        ).unsqueeze(1)
-
-        count_features = torch.cat(
-            [
-                hidden_mean,
-                hidden_std,
-                log_hidden_length,
-            ],
-            dim=1,
-        )
-
-        predicted_counts = self.count_head(
-            count_features
-        ).squeeze(-1)
-
-        return predicted_counts
-
     def encode_audio(
         self,
         waveforms,
@@ -1805,33 +1803,36 @@ class ASRModel(torch.nn.Module):
         waveforms,
         input_lengths,
         target_lengths=None,
-        count_only=False,
-        return_count=False,
     ):
+        # ==========================================
+        # 1. Shared acoustic encoder
+        # ==========================================
         hidden, hidden_lengths = self.encode_audio(
             waveforms,
             input_lengths,
         )
-    
-        predicted_counts = self.predict_phoneme_count(
-            hidden,
-            hidden_lengths,
+
+        # ==========================================
+        # 2. CTC phoneme recognition
+        # ==========================================
+        ctc_logits = self.ctc_head(
+            hidden
         )
-    
-        # Used when evaluating only the count head.
-        if count_only:
-            return (
-                predicted_counts,
-                hidden_lengths,
-            )
-    
+
+        # ==========================================
+        # 3. Segmentation
+        # ==========================================
         (
             segment_embedding,
             progress_weights,
-        ) = self.segmentation(hidden)
-    
-        # Training/evaluation with known target length.
+        ) = self.segmentation(
+            hidden
+        )
+
+        # During training we know the true number
+        # of phonemes.
         if target_lengths is not None:
+
             (
                 pooled_batch,
                 segment_lengths,
@@ -1842,43 +1843,48 @@ class ASRModel(torch.nn.Module):
                 target_lengths,
                 hidden_lengths,
             )
-    
-            logits_batch = [
-                self.segment_classifier(pooled)
+
+            segment_logits_batch = [
+                self.segment_classifier(
+                    pooled
+                )
                 for pooled in pooled_batch
             ]
-    
-            if return_count:
-                return (
-                    logits_batch,
-                    segment_lengths,
-                    hard_boundaries_batch,
-                    hidden_lengths,
-                    predicted_counts,
-                )
-    
+
             return (
-                logits_batch,
+                ctc_logits,
+                segment_logits_batch,
                 segment_lengths,
                 hard_boundaries_batch,
                 hidden_lengths,
             )
-    
-        # Real inference: no target length is supplied.
-        predicted_lengths = torch.round(
-            predicted_counts
-        ).long()
-    
-        predicted_lengths = torch.clamp(
-            predicted_lengths,
-            min=1,
+
+        # ==========================================
+        # Real inference
+        # ==========================================
+        
+        predicted_batch = greedy_ctc_decode(
+            ctc_logits=ctc_logits,
+            hidden_lengths=hidden_lengths,
         )
-    
+        
+        predicted_lengths = torch.tensor(
+            [
+                max(
+                    len(sequence),
+                    1,
+                )
+                for sequence in predicted_batch
+            ],
+            dtype=torch.long,
+            device=hidden.device,
+        )
+        
         predicted_lengths = torch.minimum(
             predicted_lengths,
             hidden_lengths.long(),
         )
-    
+        
         (
             pooled_batch,
             segment_lengths,
@@ -1889,25 +1895,45 @@ class ASRModel(torch.nn.Module):
             predicted_lengths,
             hidden_lengths,
         )
-    
-        logits_batch = [
-            self.segment_classifier(pooled)
-            for pooled in pooled_batch
-        ]
-    
+        
         return (
-            logits_batch,
+            ctc_logits,
+            predicted_batch,
             segment_lengths,
             hard_boundaries_batch,
             hidden_lengths,
-            predicted_counts,
             predicted_lengths,
         )
-    
+        
 
 # %%
 train_df = pd.read_csv(TRAIN_DS_PATH)
 val_df = pd.read_csv(TEST_DS_PATH)
+
+# %%
+train_df = train_df.head(1)
+val_df = val_df.head(1)
+
+# %%
+MAX_DIAGNOSTIC_DURATION = 45.0
+
+train_df_full = train_df.copy()
+val_df_full = val_df.copy()
+
+train_df = train_df_full[
+    train_df_full["duration"]
+    <= MAX_DIAGNOSTIC_DURATION
+].reset_index(
+    drop=True
+)
+
+val_df = val_df_full[
+    val_df_full["duration"]
+    <= MAX_DIAGNOSTIC_DURATION
+].reset_index(
+    drop=True
+)
+
 
 # %%
 train_dataset = TajweedCTCDataset(
@@ -1926,8 +1952,7 @@ val_dataset = TajweedCTCDataset(
 )
 
 
-
-MAX_PADDED_AUDIO_SECONDS = 20
+MAX_PADDED_AUDIO_SECONDS = 40
 
 MAX_PADDED_SAMPLES_PER_BATCH = int(
     SR
@@ -1984,7 +2009,7 @@ val_loader = DataLoader(
 
 
 # %%
-# next(enumerate(train_loader))
+next(enumerate(train_loader))
 
 # %%
 def save_checkpoint(
@@ -2223,6 +2248,13 @@ accelerator = Accelerator(mixed_precision="fp16", kwargs_handlers=[ddp_kwargs])
 print(f"Using device: {DEVICE}")
 print(f"Num processes: {accelerator.num_processes}")
 
+wav2vec2_model = Wav2Vec2Model.from_pretrained(
+    "facebook/wav2vec2-large-xlsr-53", ignore_mismatched_sizes=True,local_files_only=True
+)
+
+for param in wav2vec2_model.parameters():
+    param.requires_grad = True
+
 
 model = ASRModel(wav2vec2_model, SpecAugment(),dropout=0.1)
 
@@ -2235,8 +2267,7 @@ WAV2VEC2_LR = 3e-7
 CONFORMER_LR = 3e-6
 SEGMENTATION_LR = 1e-5
 CLASSIFIER_LR = 2e-5
-COUNT_HEAD_LR = 1e-5
-
+CTC_HEAD_LR = 2e-5
 
 optimizer = torch.optim.AdamW(
     [
@@ -2257,8 +2288,8 @@ optimizer = torch.optim.AdamW(
             "lr": CLASSIFIER_LR,
         },
         {
-            "params": model.count_head.parameters(),
-            "lr": COUNT_HEAD_LR,
+            "params": model.ctc_head.parameters(),
+            "lr": CTC_HEAD_LR,
         },
     ],
     weight_decay=0.01,
@@ -2359,6 +2390,68 @@ def segmentation_loss(
         all_targets,
         label_smoothing=0.05,
     )
+
+
+def compute_ctc_loss(
+    ctc_logits,
+    targets,
+    target_lengths,
+    hidden_lengths,
+):
+    # ctc_logits:
+    # (B, T, C)
+
+    log_probs = F.log_softmax(
+        ctc_logits,
+        dim=-1,
+    )
+
+    # PyTorch CTC expects:
+    # (T, B, C)
+    log_probs = log_probs.transpose(
+        0,
+        1,
+    )
+
+    ctc_targets = []
+
+    for batch_index in range(
+        targets.shape[0]
+    ):
+        target_length = int(
+            target_lengths[
+                batch_index
+            ].item()
+        )
+
+        target = targets[
+            batch_index,
+            :target_length,
+        ].long()
+
+        # Shift by +1 because:
+        # CTC ID 0 = blank
+        target = target + 1
+
+        ctc_targets.append(
+            target
+        )
+
+    ctc_targets = torch.cat(
+        ctc_targets,
+        dim=0,
+    )
+
+    return F.ctc_loss(
+        log_probs=log_probs,
+        targets=ctc_targets,
+        input_lengths=hidden_lengths,
+        target_lengths=target_lengths,
+        blank=CTC_BLANK_ID,
+        reduction="mean",
+        zero_infinity=True,
+    )
+    
 
 # %%
 model
@@ -2576,6 +2669,10 @@ def evaluate_model(
 ):
     model.eval()
 
+    # ============================================================
+    # Accumulators
+    # ============================================================
+
     total_substitutions = 0
     total_deletions = 0
     total_insertions = 0
@@ -2587,12 +2684,18 @@ def evaluate_model(
     exact_sequences = 0
     total_sequences = 0
 
+    total_count_error = 0
+    exact_count_sequences = 0
+
+    # ============================================================
+    # Validation loop
+    # ============================================================
+
     progress_bar = tqdm(
         val_loader,
-        desc="Real validation",
+        desc="CTC validation",
         disable=(
-            not accelerator
-            .is_local_main_process
+            not accelerator.is_local_main_process
         ),
     )
 
@@ -2603,42 +2706,76 @@ def evaluate_model(
         target_lengths,
     ) in progress_bar:
 
-        # No target_lengths are passed here.
+        # --------------------------------------------------------
+        # Real inference:
+        # no target_lengths are given to the model
+        # --------------------------------------------------------
+
         with accelerator.autocast():
+
             (
-                logits_batch,
+                ctc_logits,
+                predicted_batch,
                 segment_lengths,
                 hard_boundaries_batch,
                 hidden_lengths,
-                predicted_counts,
                 predicted_lengths,
             ) = model(
                 waveforms,
                 input_lengths,
             )
 
-        for batch_index, logits in enumerate(
-            logits_batch
+        # ========================================================
+        # Evaluate each sample
+        # ========================================================
+
+        for (
+            batch_index,
+            predicted_ids,
+        ) in enumerate(
+            predicted_batch
         ):
-            predicted_ids = torch.argmax(
-                logits,
-                dim=-1,
-            )
 
-            predicted_ids = (
-                predicted_ids
-                .detach()
-                .cpu()
-                .tolist()
-            )
+            # ----------------------------------------------------
+            # True sequence length
+            # ----------------------------------------------------
 
-            # Used only to remove padding from
-            # the reference sequence.
             reference_length = int(
                 target_lengths[
                     batch_index
                 ].item()
             )
+
+            # ----------------------------------------------------
+            # Predicted sequence length from CTC
+            # ----------------------------------------------------
+
+            predicted_length = int(
+                predicted_lengths[
+                    batch_index
+                ].item()
+            )
+
+            # ----------------------------------------------------
+            # Count metrics
+            # ----------------------------------------------------
+
+            count_error = abs(
+                predicted_length
+                - reference_length
+            )
+
+            total_count_error += (
+                count_error
+            )
+
+            exact_count_sequences += int(
+                count_error == 0
+            )
+
+            # ----------------------------------------------------
+            # Get true phoneme IDs
+            # ----------------------------------------------------
 
             reference_ids = (
                 targets[
@@ -2649,6 +2786,10 @@ def evaluate_model(
                 .cpu()
                 .tolist()
             )
+
+            # ----------------------------------------------------
+            # Levenshtein comparison
+            # ----------------------------------------------------
 
             alignment = levenshtein_counts(
                 reference=reference_ids,
@@ -2671,13 +2812,25 @@ def evaluate_model(
                 "matches"
             ]
 
+            # ----------------------------------------------------
+            # Accumulate sequence metrics
+            # ----------------------------------------------------
+
             total_substitutions += (
                 substitutions
             )
 
-            total_deletions += deletions
-            total_insertions += insertions
-            total_matches += matches
+            total_deletions += (
+                deletions
+            )
+
+            total_insertions += (
+                insertions
+            )
+
+            total_matches += (
+                matches
+            )
 
             total_reference_phonemes += (
                 len(reference_ids)
@@ -2699,6 +2852,10 @@ def evaluate_model(
 
             total_sequences += 1
 
+    # ============================================================
+    # Combine statistics across processes
+    # ============================================================
+
     statistics = torch.tensor(
         [
             total_substitutions,
@@ -2709,6 +2866,8 @@ def evaluate_model(
             total_predicted_phonemes,
             exact_sequences,
             total_sequences,
+            total_count_error,
+            exact_count_sequences,
         ],
         dtype=torch.float64,
         device=accelerator.device,
@@ -2718,6 +2877,10 @@ def evaluate_model(
         statistics,
         reduction="sum",
     )
+
+    # ============================================================
+    # Extract reduced values
+    # ============================================================
 
     substitutions = int(
         statistics[0].item()
@@ -2757,6 +2920,18 @@ def evaluate_model(
         1,
     )
 
+    total_count_error = int(
+        statistics[8].item()
+    )
+
+    exact_count_sequences = int(
+        statistics[9].item()
+    )
+
+    # ============================================================
+    # Final metrics
+    # ============================================================
+
     total_errors = (
         substitutions
         + deletions
@@ -2768,8 +2943,6 @@ def evaluate_model(
         / reference_phoneme_count
     )
 
-    # Fraction of reference phonemes that were
-    # correctly matched after alignment.
     aligned_match_rate = (
         matches
         / reference_phoneme_count
@@ -2779,6 +2952,20 @@ def evaluate_model(
         exact_sequence_count
         / sequence_count
     )
+
+    mean_count_error = (
+        total_count_error
+        / sequence_count
+    )
+
+    exact_count_accuracy = (
+        exact_count_sequences
+        / sequence_count
+    )
+
+    # ============================================================
+    # Return metrics
+    # ============================================================
 
     return {
         "phoneme_error_rate": (
@@ -2790,19 +2977,46 @@ def evaluate_model(
         "exact_sequence_accuracy": (
             exact_sequence_accuracy
         ),
-        "substitutions": substitutions,
-        "deletions": deletions,
-        "insertions": insertions,
-        "matches": matches,
-        "total_errors": total_errors,
+
+        "substitutions": (
+            substitutions
+        ),
+        "deletions": (
+            deletions
+        ),
+        "insertions": (
+            insertions
+        ),
+        "matches": (
+            matches
+        ),
+
+        "total_errors": (
+            total_errors
+        ),
+
         "reference_phonemes": (
             reference_phoneme_count
         ),
         "predicted_phonemes": (
             predicted_phoneme_count
         ),
-        "sequence_count": sequence_count,
+
+        "sequence_count": (
+            sequence_count
+        ),
+
+        "mean_count_error": (
+            mean_count_error
+        ),
+        "exact_count_accuracy": (
+            exact_count_accuracy
+        ),
     }
+
+# %%
+CTC_LOSS_WEIGHT = 0.05
+SEGMENT_LOSS_WEIGHT = 1.0
 
 # %%
 def train_model(
@@ -2815,54 +3029,44 @@ def train_model(
     accelerator,
     epochs=5,
     warmup_epochs=2,
-    count_loss_weight=0.1,
-    best_validation_per= float("inf"),
-    working_model_path = WORKING_MODEL_PATH,
-    working_best_model_path = WORKING_BEST_MODEL_PATH,
+    best_validation_per=float("inf"),
+    working_model_path=WORKING_MODEL_PATH,
+    working_best_model_path=WORKING_BEST_MODEL_PATH,
 ):
-    """
-    Full-model fine-tuning.
-
-    Training:
-        - true target length for segmentation
-        - phoneme cross-entropy
-        - small count-head loss
-
-    Validation:
-        - no target length passed to model
-        - PER, S/D/I and exact sequence accuracy
-
-    Best model:
-        - lowest end-to-end PER
-    """
-
-
     for epoch in range(epochs):
 
-        # ==========================================================
-        # Training
-        # ==========================================================
+        epoch_start_time = time.perf_counter()
+
+        # ============================================================
+        # TRAINING
+        # ============================================================
 
         model.train()
 
-        train_phoneme_loss_sum = 0.0
-        train_count_loss_sum = 0.0
+        train_ctc_loss_sum = 0.0
+        train_segment_loss_sum = 0.0
 
-        train_correct_phonemes = 0
+        train_correct_segments = 0
         train_phoneme_count = 0
-        train_sample_count = 0
+
+        total_data_wait_time = 0.0
+        total_step_time = 0.0
+        measured_batch_count = 0
+
+        slowest_batch_time = 0.0
+        slowest_batch_audio_seconds = 0.0
+
+        total_processed_audio_seconds = 0.0
+
+        training_start_time = time.perf_counter()
 
         train_progress = tqdm(
             train_loader,
-            desc=(
-                f"Fine-tuning "
-                f"{epoch + 1}/{epochs}"
-            ),
-            disable=(
-                not accelerator
-                .is_local_main_process
-            ),
+            desc=f"Training {epoch + 1}/{epochs}",
+            disable=not accelerator.is_local_main_process,
         )
+
+        previous_batch_end_time = time.perf_counter()
 
         for (
             waveforms,
@@ -2871,48 +3075,86 @@ def train_model(
             target_lengths,
         ) in train_progress:
 
+            # ========================================================
+            # Timing: DataLoader wait
+            # ========================================================
+
+            batch_ready_time = time.perf_counter()
+
+            current_data_wait_time = (
+                batch_ready_time
+                - previous_batch_end_time
+            )
+
+            total_data_wait_time += (
+                current_data_wait_time
+            )
+
+            if torch.cuda.is_available():
+                torch.cuda.synchronize()
+
+            step_start_time = time.perf_counter()
+
+            # ========================================================
+            # Forward pass
+            # ========================================================
+
             optimizer.zero_grad(
                 set_to_none=True
             )
 
             with accelerator.autocast():
+
                 (
-                    logits_batch,
+                    ctc_logits,
+                    segment_logits_batch,
                     segment_lengths,
                     hard_boundaries_batch,
                     hidden_lengths,
-                    predicted_counts,
                 ) = model(
                     waveforms,
                     input_lengths,
-                    target_lengths=(
-                        target_lengths
-                    ),
-                    return_count=True,
+                    target_lengths=target_lengths,
                 )
 
-                phoneme_loss = segmentation_loss(
-                    logits_batch=(
-                        logits_batch
-                    ),
+                # ----------------------------------------------------
+                # CTC loss
+                # Main phoneme-recognition objective
+                # ----------------------------------------------------
+
+                ctc_loss = compute_ctc_loss(
+                    ctc_logits=ctc_logits,
                     targets=targets,
-                    target_lengths=(
-                        target_lengths
-                    ),
+                    target_lengths=target_lengths,
+                    hidden_lengths=hidden_lengths,
                 )
 
-                count_loss = (
-                    F.smooth_l1_loss(
-                        predicted_counts.float(),
-                        target_lengths.float(),
-                    )
+                # ----------------------------------------------------
+                # Segmentation classifier loss
+                # Auxiliary objective for learning boundaries
+                # ----------------------------------------------------
+
+                segment_loss = segmentation_loss(
+                    logits_batch=segment_logits_batch,
+                    targets=targets,
+                    target_lengths=target_lengths,
                 )
+
+                # ----------------------------------------------------
+                # Combined loss
+                # ----------------------------------------------------
 
                 total_loss = (
-                    phoneme_loss
-                    + count_loss_weight
-                    * count_loss
+                    CTC_LOSS_WEIGHT
+                    * ctc_loss
+                    +
+                    SEGMENT_LOSS_WEIGHT
+                    * segment_loss
                 )
+
+            # ========================================================
+            # Backward pass
+            # ========================================================
 
             accelerator.backward(
                 total_loss
@@ -2926,43 +3168,93 @@ def train_model(
 
             optimizer.step()
 
+            # ========================================================
+            # Timing
+            # ========================================================
+
+            if torch.cuda.is_available():
+                torch.cuda.synchronize()
+
+            step_end_time = time.perf_counter()
+
+            current_step_time = (
+                step_end_time
+                - step_start_time
+            )
+
+            total_step_time += (
+                current_step_time
+            )
+
+            measured_batch_count += 1
+
+            batch_audio_seconds = float(
+                input_lengths.sum().item()
+                / SR
+            )
+
+            total_processed_audio_seconds += (
+                batch_audio_seconds
+            )
+
+            if (
+                current_step_time
+                > slowest_batch_time
+            ):
+                slowest_batch_time = (
+                    current_step_time
+                )
+
+                slowest_batch_audio_seconds = (
+                    batch_audio_seconds
+                )
+
+            previous_batch_end_time = (
+                step_end_time
+            )
+
+            # ========================================================
+            # Training statistics
+            # ========================================================
+
             batch_phoneme_count = int(
                 target_lengths.sum().item()
             )
 
-            batch_sample_count = int(
-                target_lengths.numel()
-            )
-
-            train_phoneme_loss_sum += (
+            train_ctc_loss_sum += (
                 float(
-                    phoneme_loss
+                    ctc_loss
                     .detach()
                     .item()
                 )
                 * batch_phoneme_count
             )
 
-            train_count_loss_sum += (
+            train_segment_loss_sum += (
                 float(
-                    count_loss
+                    segment_loss
                     .detach()
                     .item()
                 )
-                * batch_sample_count
+                * batch_phoneme_count
             )
 
             train_phoneme_count += (
                 batch_phoneme_count
             )
 
-            train_sample_count += (
-                batch_sample_count
-            )
+            # ========================================================
+            # Auxiliary segment-classifier accuracy
+            # This is NOT the final CTC accuracy.
+            # ========================================================
 
-            for batch_index, logits in enumerate(
-                logits_batch
+            for (
+                batch_index,
+                segment_logits,
+            ) in enumerate(
+                segment_logits_batch
             ):
+
                 target_length = int(
                     target_lengths[
                         batch_index
@@ -2970,7 +3262,7 @@ def train_model(
                 )
 
                 predictions = torch.argmax(
-                    logits,
+                    segment_logits,
                     dim=-1,
                 )
 
@@ -2981,37 +3273,59 @@ def train_model(
                     predictions.device
                 )
 
-                train_correct_phonemes += int(
+                train_correct_segments += int(
                     (
-                        predictions == target
+                        predictions
+                        == target
                     )
                     .sum()
                     .item()
                 )
 
+            # ========================================================
+            # Progress display
+            # ========================================================
+
             train_progress.set_postfix(
                 total=(
                     f"{total_loss.detach().item():.4f}"
                 ),
-                phoneme=(
-                    f"{phoneme_loss.detach().item():.4f}"
+                ctc=(
+                    f"{ctc_loss.detach().item():.4f}"
                 ),
-                count=(
-                    f"{count_loss.detach().item():.4f}"
+                segment=(
+                    f"{segment_loss.detach().item():.4f}"
+                ),
+                wait=(
+                    f"{current_data_wait_time:.2f}s"
+                ),
+                step=(
+                    f"{current_step_time:.2f}s"
                 ),
             )
 
-        # ==========================================================
-        # Reduce training statistics across processes
-        # ==========================================================
+        # ============================================================
+        # END TRAINING
+        # ============================================================
+
+        if torch.cuda.is_available():
+            torch.cuda.synchronize()
+
+        training_time = (
+            time.perf_counter()
+            - training_start_time
+        )
+
+        # ============================================================
+        # Combine training statistics across processes
+        # ============================================================
 
         train_statistics = torch.tensor(
             [
-                train_phoneme_loss_sum,
-                train_count_loss_sum,
-                train_correct_phonemes,
+                train_ctc_loss_sum,
+                train_segment_loss_sum,
+                train_correct_segments,
                 train_phoneme_count,
-                train_sample_count,
             ],
             dtype=torch.float64,
             device=accelerator.device,
@@ -3024,62 +3338,77 @@ def train_model(
 
         global_train_phoneme_count = max(
             int(
-                train_statistics[3].item()
+                train_statistics[
+                    3
+                ].item()
             ),
             1,
         )
 
-        global_train_sample_count = max(
-            int(
-                train_statistics[4].item()
-            ),
-            1,
-        )
-
-        average_train_phoneme_loss = (
-            train_statistics[0].item()
+        average_train_ctc_loss = (
+            train_statistics[
+                0
+            ].item()
             / global_train_phoneme_count
         )
 
-        average_train_count_loss = (
-            train_statistics[1].item()
-            / global_train_sample_count
+        average_train_segment_loss = (
+            train_statistics[
+                1
+            ].item()
+            / global_train_phoneme_count
         )
 
-        train_accuracy = (
-            train_statistics[2].item()
+        train_segment_accuracy = (
+            train_statistics[
+                2
+            ].item()
             / global_train_phoneme_count
         )
 
         average_train_total_loss = (
-            average_train_phoneme_loss
-            + count_loss_weight
-            * average_train_count_loss
+            CTC_LOSS_WEIGHT
+            * average_train_ctc_loss
+            +
+            SEGMENT_LOSS_WEIGHT
+            * average_train_segment_loss
         )
 
         train_metrics = {
             "total_loss": (
                 average_train_total_loss
             ),
-            "phoneme_loss": (
-                average_train_phoneme_loss
+            "ctc_loss": (
+                average_train_ctc_loss
             ),
-            "count_loss": (
-                average_train_count_loss
+            "segment_loss": (
+                average_train_segment_loss
             ),
-            "phoneme_accuracy": (
-                train_accuracy
+            "segment_accuracy": (
+                train_segment_accuracy
             ),
         }
 
-        # ==========================================================
-        # Real validation
-        # ==========================================================
+        # ============================================================
+        # VALIDATION
+        # ============================================================
+
+        validation_start_time = (
+            time.perf_counter()
+        )
 
         validation_metrics = evaluate_model(
             model=model,
             val_loader=val_loader,
             accelerator=accelerator,
+        )
+
+        if torch.cuda.is_available():
+            torch.cuda.synchronize()
+
+        validation_time = (
+            time.perf_counter()
+            - validation_start_time
         )
 
         validation_per = (
@@ -3088,24 +3417,31 @@ def train_model(
             ]
         )
 
-        # ==========================================================
+        # ============================================================
         # Scheduler
-        # ==========================================================
+        # ============================================================
 
         if epoch < warmup_epochs:
+
             warmup_scheduler.step()
-            active_scheduler = "warmup"
+
+            active_scheduler = (
+                "warmup"
+            )
 
         else:
+
             plateau_scheduler.step(
                 validation_per
             )
 
-            active_scheduler = "plateau"
+            active_scheduler = (
+                "plateau"
+            )
 
-        # ==========================================================
-        # Best-model selection
-        # ==========================================================
+        # ============================================================
+        # Best model
+        # ============================================================
 
         improved = (
             validation_per
@@ -3117,20 +3453,121 @@ def train_model(
                 validation_per
             )
 
-        # ==========================================================
-        # Print training progress
-        # ==========================================================
+        # ============================================================
+        # Timing statistics
+        # ============================================================
+
+        average_data_wait_time = (
+            total_data_wait_time
+            / max(
+                measured_batch_count,
+                1,
+            )
+        )
+
+        average_step_time = (
+            total_step_time
+            / max(
+                measured_batch_count,
+                1,
+            )
+        )
+
+        measured_training_time = (
+            total_data_wait_time
+            + total_step_time
+        )
+
+        data_wait_percentage = (
+            100.0
+            * total_data_wait_time
+            / max(
+                measured_training_time,
+                1e-8,
+            )
+        )
+
+        model_work_percentage = (
+            100.0
+            * total_step_time
+            / max(
+                measured_training_time,
+                1e-8,
+            )
+        )
+
+        audio_throughput = (
+            total_processed_audio_seconds
+            / max(
+                training_time,
+                1e-8,
+            )
+        )
+
+        epoch_time_before_saving = (
+            time.perf_counter()
+            - epoch_start_time
+        )
+
+        timing_metrics = {
+            "epoch_minutes_before_saving": (
+                epoch_time_before_saving
+                / 60.0
+            ),
+            "training_minutes": (
+                training_time
+                / 60.0
+            ),
+            "validation_minutes": (
+                validation_time
+                / 60.0
+            ),
+            "average_data_wait_seconds": (
+                average_data_wait_time
+            ),
+            "average_step_seconds": (
+                average_step_time
+            ),
+            "data_wait_percentage": (
+                data_wait_percentage
+            ),
+            "model_work_percentage": (
+                model_work_percentage
+            ),
+            "slowest_batch_seconds": (
+                slowest_batch_time
+            ),
+            "slowest_batch_audio_seconds": (
+                slowest_batch_audio_seconds
+            ),
+            "audio_throughput": (
+                audio_throughput
+            ),
+            "training_batches": (
+                measured_batch_count
+            ),
+        }
+
+        train_metrics[
+            "timing"
+        ] = timing_metrics
+
+        # ============================================================
+        # PRINT RESULTS
+        # ============================================================
 
         if accelerator.is_main_process:
+
             print()
             print("=" * 78)
-
             print(
                 f"Epoch {epoch + 1}/{epochs}"
             )
+            print("=" * 78)
 
             print()
             print("Training")
+            print("-" * 40)
 
             print(
                 f"Total loss          : "
@@ -3138,24 +3575,23 @@ def train_model(
             )
 
             print(
-                f"Phoneme loss        : "
-                f"{average_train_phoneme_loss:.4f}"
+                f"CTC loss            : "
+                f"{average_train_ctc_loss:.4f}"
             )
 
             print(
-                f"Count loss          : "
-                f"{average_train_count_loss:.4f}"
+                f"Segment loss        : "
+                f"{average_train_segment_loss:.4f}"
             )
 
             print(
-                f"Phoneme accuracy    : "
-                f"{train_accuracy:.2%}"
+                f"Segment accuracy    : "
+                f"{train_segment_accuracy:.2%}"
             )
 
             print()
-            print(
-                "Real end-to-end validation"
-            )
+            print("CTC validation")
+            print("-" * 40)
 
             print(
                 f"Phoneme error rate  : "
@@ -3197,6 +3633,25 @@ def train_model(
                 f"{validation_metrics['predicted_phonemes']}"
             )
 
+            # These exist after our Step 8.
+            if (
+                "exact_count_accuracy"
+                in validation_metrics
+            ):
+                print(
+                    f"Exact count         : "
+                    f"{validation_metrics['exact_count_accuracy']:.2%}"
+                )
+
+            if (
+                "mean_count_error"
+                in validation_metrics
+            ):
+                print(
+                    f"Mean count error    : "
+                    f"{validation_metrics['mean_count_error']:.4f}"
+                )
+
             print(
                 f"Best validation PER : "
                 f"{best_validation_per:.2%}"
@@ -3208,19 +3663,74 @@ def train_model(
             )
 
             print()
+            print("Timing")
+            print("-" * 40)
+
+            print(
+                f"Training time       : "
+                f"{training_time / 60:.2f} min"
+            )
+
+            print(
+                f"Validation time     : "
+                f"{validation_time / 60:.2f} min"
+            )
+
+            print(
+                f"Mean data wait      : "
+                f"{average_data_wait_time:.4f} sec/batch"
+            )
+
+            print(
+                f"Mean model step     : "
+                f"{average_step_time:.4f} sec/batch"
+            )
+
+            print(
+                f"Data wait share     : "
+                f"{data_wait_percentage:.2f}%"
+            )
+
+            print(
+                f"Model work share    : "
+                f"{model_work_percentage:.2f}%"
+            )
+
+            print(
+                f"Slowest step        : "
+                f"{slowest_batch_time:.2f} sec"
+            )
+
+            print(
+                f"Slowest batch audio : "
+                f"{slowest_batch_audio_seconds:.2f} sec"
+            )
+
+            print(
+                f"Audio throughput    : "
+                f"{audio_throughput:.2f} "
+                f"audio-sec/wall-sec"
+            )
+
+            print()
             print("Learning rates")
+            print("-" * 40)
 
             module_names = [
                 "Wav2Vec2",
                 "Conformer",
                 "Segmentation",
                 "Classifier",
-                "Count head",
+                "CTC head",
             ]
 
-            for group_index, group in enumerate(
+            for (
+                group_index,
+                group,
+            ) in enumerate(
                 optimizer.param_groups
             ):
+
                 if (
                     group_index
                     < len(module_names)
@@ -3243,23 +3753,23 @@ def train_model(
             print("=" * 78)
             print()
 
-        # ==========================================================
-        # Save checkpoints
-        # ==========================================================
+        # ============================================================
+        # SAVE CHECKPOINT
+        # ============================================================
 
         accelerator.wait_for_everyone()
+
+        checkpoint_start_time = (
+            time.perf_counter()
+        )
 
         if accelerator.is_main_process:
 
             save_checkpoint(
                 model=model,
                 optimizer=optimizer,
-                warmup_scheduler=(
-                    warmup_scheduler
-                ),
-                plateau_scheduler=(
-                    plateau_scheduler
-                ),
+                warmup_scheduler=warmup_scheduler,
+                plateau_scheduler=plateau_scheduler,
                 accelerator=accelerator,
                 epoch=epoch,
                 train_metrics=train_metrics,
@@ -3273,15 +3783,12 @@ def train_model(
             )
 
             if improved:
+
                 save_checkpoint(
                     model=model,
                     optimizer=optimizer,
-                    warmup_scheduler=(
-                        warmup_scheduler
-                    ),
-                    plateau_scheduler=(
-                        plateau_scheduler
-                    ),
+                    warmup_scheduler=warmup_scheduler,
+                    plateau_scheduler=plateau_scheduler,
                     accelerator=accelerator,
                     epoch=epoch,
                     train_metrics=(
@@ -3293,14 +3800,40 @@ def train_model(
                     best_validation_per=(
                         best_validation_per
                     ),
-                    path=working_best_model_path,
+                    path=(
+                        working_best_model_path
+                    ),
                 )
 
                 print(
-                    "Best fine-tuned model saved"
+                    "Best model saved"
                 )
 
         accelerator.wait_for_everyone()
+
+        checkpoint_time = (
+            time.perf_counter()
+            - checkpoint_start_time
+        )
+
+        total_epoch_time = (
+            time.perf_counter()
+            - epoch_start_time
+        )
+
+        if accelerator.is_main_process:
+
+            print(
+                f"Checkpoint time     : "
+                f"{checkpoint_time:.2f} sec"
+            )
+
+            print(
+                f"Complete epoch time : "
+                f"{total_epoch_time / 60:.2f} min"
+            )
+
+            print("-" * 78)
 
     return best_validation_per
 
@@ -3316,10 +3849,11 @@ best_validation_per = train_model(
     warmup_scheduler=warmup_scheduler,
     plateau_scheduler=plateau_scheduler,
     accelerator=accelerator,
-    epochs=NUM_EPOCHS,
+    epochs= 50, #NUM_EPOCHS,
     warmup_epochs=WARMUP_EPOCHS,
-    count_loss_weight=0.1,
-    best_validation_per=best_validation_per
+    best_validation_per=best_validation_per,
+    working_model_path=WORKING_MODEL_PATH,
+    working_best_model_path=WORKING_BEST_MODEL_PATH,
 )
 
 # %%
