@@ -1911,10 +1911,6 @@ train_df = pd.read_csv(TRAIN_DS_PATH)
 val_df = pd.read_csv(TEST_DS_PATH)
 
 # %%
-train_df = train_df.head(1)
-val_df = val_df.head(1)
-
-# %%
 MAX_DIAGNOSTIC_DURATION = 45.0
 
 train_df_full = train_df.copy()
@@ -3849,7 +3845,7 @@ best_validation_per = train_model(
     warmup_scheduler=warmup_scheduler,
     plateau_scheduler=plateau_scheduler,
     accelerator=accelerator,
-    epochs= 50, #NUM_EPOCHS,
+    epochs= NUM_EPOCHS,
     warmup_epochs=WARMUP_EPOCHS,
     best_validation_per=best_validation_per,
     working_model_path=WORKING_MODEL_PATH,
