@@ -1,0 +1,284 @@
+10579.6s 62 ==============================================================================
+10579.6s 63 Epoch 17/18
+10579.6s 64 ==============================================================================
+10579.6s 65 
+10579.6s 66 Training
+10579.6s 67 ----------------------------------------
+10579.6s 68 Total loss          : 2.6184
+10579.6s 69 CTC loss            : 1.1702
+10579.6s 70 Segment loss        : 2.5599
+10579.6s 71 Segment accuracy    : 52.65%
+10579.6s 72 
+10579.6s 73 CTC validation
+10579.6s 74 ----------------------------------------
+10579.6s 75 Phoneme error rate  : 53.11%
+10579.6s 76 Aligned match rate  : 47.32%
+10579.6s 77 Exact sequences     : 0.00%
+10579.6s 78 Substitutions       : 8593
+10579.6s 79 Deletions           : 40004
+10579.6s 80 Insertions          : 403
+10579.6s 81 Reference phonemes  : 92255
+10579.6s 82 Predicted phonemes  : 52654
+10579.6s 83 Exact count         : 0.04%
+10579.6s 84 Mean count error    : 17.1353
+10579.6s 85 Best validation PER : 53.11%
+10579.6s 86 Scheduler           : plateau
+10579.6s 87 
+10579.6s 88 Timing
+10579.6s 89 ----------------------------------------
+10579.6s 90 Training time       : 171.58 min
+10579.6s 91 Validation time     : 3.79 min
+10579.6s 92 Mean data wait      : 0.0043 sec/batch
+10579.6s 93 Mean model step     : 1.0951 sec/batch
+10579.6s 94 Data wait share     : 0.39%
+10579.6s 95 Model work share    : 99.61%
+10579.6s 96 Slowest step        : 4.34 sec
+10579.6s 97 Slowest batch audio : 47.73 sec
+10579.6s 98 Audio throughput    : 41.04 audio-sec/wall-sec
+10579.6s 99 
+10579.6s 100 Learning rates
+10579.6s 101 ----------------------------------------
+10579.6s 102 Wav2Vec2      : 3e-07
+10579.6s 103 Conformer     : 3e-06
+10579.6s 104 Segmentation  : 1e-05
+10579.6s 105 Classifier    : 2e-05
+10579.6s 106 CTC head      : 2e-05
+10579.6s 107 
+10579.6s 108 GPU memory usage
+10579.6s 109 ----------------------------------------
+10579.6s 110 GPU memory allocated : 2.81 GB
+10579.6s 111 GPU memory reserved  : 9.36 GB
+10579.6s 112 GPU total memory     : 14.56 GB
+10579.6s 113 ==============================================================================
+10579.6s 114 
+10580.9s 115 Best model saved
+10580.9s 116 Checkpoint time     : 1.45 sec
+10580.9s 117 Complete epoch time : 175.39 min
+10580.9s 118 ------------------------------------------------------------------------------
+21072.3s 119 
+21072.3s 120 ==============================================================================
+21072.3s 121 Epoch 18/18
+21072.3s 122 ==============================================================================
+21072.3s 123 
+21072.3s 124 Training
+21072.3s 125 ----------------------------------------
+21072.3s 126 Total loss          : 2.5624
+21072.3s 127 CTC loss            : 1.1389
+21072.3s 128 Segment loss        : 2.5055
+21072.3s 129 Segment accuracy    : 54.01%
+21072.3s 130 
+21072.3s 131 CTC validation
+21072.3s 132 ----------------------------------------
+21072.3s 133 Phoneme error rate  : 48.39%
+21072.3s 134 Aligned match rate  : 52.31%
+21072.3s 135 Exact sequences     : 0.00%
+21072.3s 136 Substitutions       : 9792
+21072.3s 137 Deletions           : 34201
+21072.3s 138 Insertions          : 651
+21072.3s 139 Reference phonemes  : 92255
+21072.3s 140 Predicted phonemes  : 58705
+21072.3s 141 Exact count         : 0.04%
+21072.3s 142 Mean count error    : 14.5387
+21072.3s 143 Best validation PER : 48.39%
+21072.3s 144 Scheduler           : plateau
+21072.3s 145 
+21072.3s 146 Timing
+21072.3s 147 ----------------------------------------
+21072.3s 148 Training time       : 171.05 min
+21072.3s 149 Validation time     : 3.80 min
+21072.3s 150 Mean data wait      : 0.0039 sec/batch
+21072.3s 151 Mean model step     : 1.0922 sec/batch
+21072.3s 152 Data wait share     : 0.35%
+21072.3s 153 Model work share    : 99.65%
+21072.3s 154 Slowest step        : 1.83 sec
+21072.3s 155 Slowest batch audio : 51.40 sec
+21072.3s 156 Audio throughput    : 41.15 audio-sec/wall-sec
+21072.3s 157 
+21072.3s 158 Learning rates
+21072.3s 159 ----------------------------------------
+21072.3s 160 Wav2Vec2      : 3e-07
+21072.3s 161 Conformer     : 3e-06
+21072.3s 162 Segmentation  : 1e-05
+21072.3s 163 Classifier    : 2e-05
+21072.3s 164 CTC head      : 2e-05
+21072.3s 165 
+21072.3s 166 GPU memory usage
+21072.3s 167 ----------------------------------------
+21072.3s 168 GPU memory allocated : 2.81 GB
+21072.3s 169 GPU memory reserved  : 9.36 GB
+21072.3s 170 GPU total memory     : 14.56 GB
+21072.3s 171 ==============================================================================
+21072.3s 172 
+21073.9s 173 Best model saved
+21073.9s 174 Checkpoint time     : 1.80 sec
+21073.9s 175 Complete epoch time : 174.88 min
+8769.2s 82 ==============================================================================
+8769.2s 83 Epoch 19/20
+8769.2s 84 ==============================================================================
+8769.2s 85 
+8769.2s 86 Training
+8769.2s 87 ----------------------------------------
+8769.2s 88 Total loss          : 2.5064
+8769.2s 89 CTC loss            : 1.1092
+8769.2s 90 Segment loss        : 2.4509
+8769.2s 91 Segment accuracy    : 55.60%
+8769.2s 92 
+8769.2s 93 CTC validation
+8769.2s 94 ----------------------------------------
+8769.2s 95 Phoneme error rate  : 49.11%
+8769.2s 96 Aligned match rate  : 51.50%
+8769.2s 97 Exact sequences     : 0.00%
+8769.2s 98 Substitutions       : 9518
+8769.2s 99 Deletions           : 35230
+8769.2s 100 Insertions          : 556
+8769.2s 101 Reference phonemes  : 92255
+8769.2s 102 Predicted phonemes  : 57581
+8769.2s 103 Exact count         : 0.17%
+8769.2s 104 Mean count error    : 15.0073
+8769.2s 105 Best validation PER : 48.39%
+8769.2s 106 Scheduler           : plateau
+8769.2s 107 
+8769.2s 108 Timing
+8769.2s 109 ----------------------------------------
+8769.2s 110 Training time       : 141.57 min
+8769.2s 111 Validation time     : 3.34 min
+8769.2s 112 Mean data wait      : 0.0043 sec/batch
+8769.2s 113 Mean model step     : 1.2792 sec/batch
+8769.2s 114 Data wait share     : 0.33%
+8769.2s 115 Model work share    : 99.67%
+8769.2s 116 Slowest step        : 5.67 sec
+8769.2s 117 Slowest batch audio : 59.61 sec
+8769.2s 118 Audio throughput    : 49.73 audio-sec/wall-sec
+8769.2s 119 
+8769.2s 120 Learning rates
+8769.2s 121 ----------------------------------------
+8769.2s 122 Wav2Vec2      : 3e-07
+8769.2s 123 Conformer     : 3e-06
+8769.2s 124 Segmentation  : 1e-05
+8769.2s 125 Classifier    : 2e-05
+8769.2s 126 CTC head      : 2e-05
+8769.2s 127 
+8769.2s 128 GPU memory usage
+8769.2s 129 ----------------------------------------
+8769.2s 130 GPU memory allocated : 3.61 GB
+8769.2s 131 GPU memory reserved  : 8.94 GB
+8769.2s 132 GPU total memory     : 14.56 GB
+8769.2s 133 ==============================================================================
+8769.2s 134 
+8769.7s 135 Checkpoint time     : 0.67 sec
+8769.7s 136 Complete epoch time : 144.92 min
+8769.7s 137 ------------------------------------------------------------------------------
+17256.9s 138 
+17256.9s 139 ==============================================================================
+17256.9s 140 Epoch 20/20
+17256.9s 141 ==============================================================================
+17256.9s 142 
+17256.9s 143 Training
+17256.9s 144 ----------------------------------------
+17256.9s 145 Total loss          : 2.4622
+17256.9s 146 CTC loss            : 1.0850
+17256.9s 147 Segment loss        : 2.4079
+17256.9s 148 Segment accuracy    : 56.64%
+17256.9s 149 
+17256.9s 150 CTC validation
+17256.9s 151 ----------------------------------------
+17256.9s 152 Phoneme error rate  : 49.15%
+17256.9s 153 Aligned match rate  : 51.44%
+17256.9s 154 Exact sequences     : 0.00%
+17256.9s 155 Substitutions       : 8817
+17256.9s 156 Deletions           : 35983
+17256.9s 157 Insertions          : 543
+17256.9s 158 Reference phonemes  : 92255
+17256.9s 159 Predicted phonemes  : 56815
+17256.9s 160 Exact count         : 0.17%
+17256.9s 161 Mean count error    : 15.3545
+17256.9s 162 Best validation PER : 48.39%
+17256.9s 163 Scheduler           : plateau
+17256.9s 164 
+17256.9s 165 Timing
+17256.9s 166 ----------------------------------------
+17256.9s 167 Training time       : 138.16 min
+17256.9s 168 Validation time     : 3.29 min
+17256.9s 169 Mean data wait      : 0.0042 sec/batch
+17256.9s 170 Mean model step     : 1.2483 sec/batch
+17256.9s 171 Data wait share     : 0.33%
+17256.9s 172 Model work share    : 99.67%
+17256.9s 173 Slowest step        : 1.95 sec
+17256.9s 174 Slowest batch audio : 70.12 sec
+17256.9s 175 Audio throughput    : 50.95 audio-sec/wall-sec
+17256.9s 176 
+17256.9s 177 Learning rates
+17256.9s 178 ----------------------------------------
+17256.9s 179 Wav2Vec2      : 3e-07
+17256.9s 180 Conformer     : 3e-06
+17256.9s 181 Segmentation  : 1e-05
+17256.9s 182 Classifier    : 2e-05
+17256.9s 183 CTC head      : 2e-05
+17256.9s 184 
+17256.9s 185 GPU memory usage
+17256.9s 186 ----------------------------------------
+17256.9s 187 GPU memory allocated : 3.62 GB
+17256.9s 188 GPU memory reserved  : 8.94 GB
+17256.9s 189 GPU total memory     : 14.56 GB
+17256.9s 190 ==============================================================================
+17256.9s 191 
+17259.3s 192 Checkpoint time     : 2.60 sec
+17259.3s 193 Complete epoch time : 141.49 min
+17259.3s 194 ------------------------------------------------------------------------------
+5697.8s 62 ==============================================================================
+5697.8s 63 Epoch 22/22
+5697.8s 64 ==============================================================================
+5697.8s 65 
+5697.8s 66 Training
+5697.8s 67 ----------------------------------------
+5697.8s 68 Total loss          : 2.3793
+5697.8s 69 CTC loss            : 1.0468
+5697.8s 70 Segment loss        : 2.3269
+5697.8s 71 Segment accuracy    : 58.88%
+5697.8s 72 
+5697.8s 73 CTC validation
+5697.8s 74 ----------------------------------------
+5697.8s 75 Phoneme error rate  : 48.22%
+5697.8s 76 Aligned match rate  : 52.35%
+5697.8s 77 Exact sequences     : 0.00%
+5697.8s 78 Substitutions       : 8798
+5697.8s 79 Deletions           : 35164
+5697.8s 80 Insertions          : 523
+5697.8s 81 Reference phonemes  : 92255
+5697.8s 82 Predicted phonemes  : 57614
+5697.8s 83 Exact count         : 0.13%
+5697.8s 84 Mean count error    : 15.0030
+5697.8s 85 Best validation PER : 47.58%
+5697.8s 86 Scheduler           : plateau
+5697.8s 87 
+5697.8s 88 Timing
+5697.8s 89 ----------------------------------------
+5697.8s 90 Training time       : 91.29 min
+5697.8s 91 Validation time     : 2.34 min
+5697.8s 92 Mean data wait      : 0.0057 sec/batch
+5697.8s 93 Mean model step     : 2.3191 sec/batch
+5697.8s 94 Data wait share     : 0.25%
+5697.8s 95 Model work share    : 99.75%
+5697.8s 96 Slowest step        : 7.62 sec
+5697.8s 97 Slowest batch audio : 182.15 sec
+5697.8s 98 Audio throughput    : 77.13 audio-sec/wall-sec
+5697.8s 99 
+5697.8s 100 Learning rates
+5697.8s 101 ----------------------------------------
+5697.8s 102 Wav2Vec2      : 3e-07
+5697.8s 103 Conformer     : 3e-06
+5697.8s 104 Segmentation  : 1e-05
+5697.8s 105 Classifier    : 2e-05
+5697.8s 106 CTC head      : 2e-05
+5697.8s 107 
+5697.8s 108 GPU memory usage
+5697.8s 109 ----------------------------------------
+5697.8s 110 GPU memory allocated : 8.41 GB
+5697.8s 111 GPU memory reserved  : 13.99 GB
+5697.8s 112 GPU total memory     : 14.56 GB
+5697.8s 113 ==============================================================================
+5697.8s 114 
+5698.3s 115 Checkpoint time     : 0.66 sec
+5698.3s 116 Complete epoch time : 93.64 min
+5698.3s 117 ------------------------------------------------------------------------------
+
