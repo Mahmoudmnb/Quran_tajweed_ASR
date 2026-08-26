@@ -32,7 +32,7 @@ import time
 # %%
 # ? this is for local training
 
-MODEL_PATH = "../../models/best_checkpoint_with_count_head_temp.pth"
+MODEL_PATH = "../../models/final_best_checkpoint.pth"
 WORKING_MODEL_PATH = "../../models/checkpoint.pth"
 WORKING_BEST_MODEL_PATH = "../../models/best_checkpoint.pth"
 
@@ -154,7 +154,6 @@ PHONEMES: List[str] = (
 
 
 PHONEMES_CTC: List[str] =  PHONEMES
-
 
 
 phoneme_to_id: Dict[str, int] = {p: i for i, p in enumerate(PHONEMES_CTC)}
@@ -1960,8 +1959,6 @@ MINIMUM_TRAIN_SPEED_FACTOR = min(
 )
 
 
-MAX_TOKENS =  BATCH_SIZE * 16000 * 20
-
 train_sampler = DynamicBatchSampler(
     dataset=train_dataset,
     max_padded_samples_per_batch=(
@@ -1983,7 +1980,7 @@ val_sampler = DynamicBatchSampler(
     minimum_speed_factor=1.0,
 )
 
-NUM_WORKERS = 2
+NUM_WORKERS = 4
 
 train_loader = DataLoader(
     train_dataset,
@@ -3011,7 +3008,7 @@ def evaluate_model(
     }
 
 # %%
-CTC_LOSS_WEIGHT = 0.05
+CTC_LOSS_WEIGHT = 0.10
 SEGMENT_LOSS_WEIGHT = 1.0
 
 # %%
@@ -3024,12 +3021,146 @@ def train_model(
     plateau_scheduler,
     accelerator,
     epochs=5,
+    start_epoch=0,
     warmup_epochs=2,
     best_validation_per=float("inf"),
     working_model_path=WORKING_MODEL_PATH,
     working_best_model_path=WORKING_BEST_MODEL_PATH,
+    training_mode="joint",
 ):
-    for epoch in range(epochs):
+    
+    valid_training_modes = {
+        "ctc",
+        "segmentation",
+        "joint",
+    }
+
+    if training_mode not in valid_training_modes:
+        raise ValueError(
+            f"Unknown training_mode: {training_mode}. "
+            f"Expected one of {valid_training_modes}"
+        )
+
+    unwrapped_model = accelerator.unwrap_model(
+        model
+    )
+
+
+    def set_requires_grad(
+        module,
+        requires_grad,
+    ):
+        for parameter in module.parameters():
+            parameter.requires_grad = requires_grad
+
+
+    # ============================================================
+    # Configure which parts receive gradients
+    # ============================================================
+
+    if training_mode == "ctc":
+
+        set_requires_grad(
+            unwrapped_model.wav2vec2,
+            True,
+        )
+
+        set_requires_grad(
+            unwrapped_model.conformer,
+            True,
+        )
+
+        set_requires_grad(
+            unwrapped_model.ctc_head,
+            True,
+        )
+
+        set_requires_grad(
+            unwrapped_model.segmentation,
+            False,
+        )
+
+        set_requires_grad(
+            unwrapped_model.segment_classifier,
+            False,
+        )
+
+
+    elif training_mode == "segmentation":
+
+        set_requires_grad(
+            unwrapped_model.wav2vec2,
+            False,
+        )
+
+        set_requires_grad(
+            unwrapped_model.conformer,
+            False,
+        )
+
+        set_requires_grad(
+            unwrapped_model.ctc_head,
+            False,
+        )
+
+        set_requires_grad(
+            unwrapped_model.segmentation,
+            True,
+        )
+
+        set_requires_grad(
+            unwrapped_model.segment_classifier,
+            True,
+        )
+
+
+    elif training_mode == "joint":
+
+        set_requires_grad(
+            unwrapped_model.wav2vec2,
+            True,
+        )
+
+        set_requires_grad(
+            unwrapped_model.conformer,
+            True,
+        )
+
+        set_requires_grad(
+            unwrapped_model.ctc_head,
+            True,
+        )
+
+        set_requires_grad(
+            unwrapped_model.segmentation,
+            True,
+        )
+
+        set_requires_grad(
+            unwrapped_model.segment_classifier,
+            True,
+        )
+
+
+    if accelerator.is_main_process:
+
+        print()
+        print("=" * 78)
+        print(
+            f"Training mode: "
+            f"{training_mode.upper()}"
+        )
+        print("=" * 78)
+
+    
+    end_epoch = start_epoch + epochs
+
+    for epoch in range(
+        start_epoch,
+        end_epoch,
+    ):
+        if torch.cuda.is_available():
+            torch.cuda.reset_peak_memory_stats()
 
         epoch_start_time = time.perf_counter()
 
@@ -3038,6 +3169,48 @@ def train_model(
         # ============================================================
 
         model.train()
+
+        # ============================================================
+        # Keep frozen modules deterministic
+        # ============================================================
+
+        if training_mode == "ctc":
+        
+            unwrapped_model.wav2vec2.train()
+            unwrapped_model.conformer.train()
+            unwrapped_model.ctc_head.train()
+            unwrapped_model.spec_augment.train()
+
+            unwrapped_model.segmentation.eval()
+            unwrapped_model.segment_classifier.eval()
+
+
+        elif training_mode == "segmentation":
+        
+            # Frozen acoustic encoder.
+            # Keep it in eval mode so dropout does not change
+            # the representation seen by segmentation.
+            unwrapped_model.wav2vec2.eval()
+            unwrapped_model.conformer.eval()
+            unwrapped_model.ctc_head.eval()
+            unwrapped_model.spec_augment.eval()
+
+            unwrapped_model.segmentation.train()
+            unwrapped_model.segment_classifier.train()
+
+
+        elif training_mode == "joint":
+        
+            unwrapped_model.wav2vec2.train()
+            unwrapped_model.conformer.train()
+            unwrapped_model.ctc_head.train()
+            unwrapped_model.spec_augment.train()
+
+            unwrapped_model.segmentation.train()
+            unwrapped_model.segment_classifier.train()
+
+
+
 
         train_ctc_loss_sum = 0.0
         train_segment_loss_sum = 0.0
@@ -3056,9 +3229,15 @@ def train_model(
 
         training_start_time = time.perf_counter()
 
+
+        desc=(
+            f"Training {epoch + 1}/"
+            f"{end_epoch}"
+        )
+        
         train_progress = tqdm(
             train_loader,
-            desc=f"Training {epoch + 1}/{epochs}",
+            desc=desc,
             disable=not accelerator.is_local_main_process,
         )
 
@@ -3140,13 +3319,30 @@ def train_model(
                 # Combined loss
                 # ----------------------------------------------------
 
-                total_loss = (
-                    CTC_LOSS_WEIGHT
-                    * ctc_loss
-                    +
-                    SEGMENT_LOSS_WEIGHT
-                    * segment_loss
-                )
+                # ============================================================
+                # Select optimization objective
+                # ============================================================
+
+                if training_mode == "ctc":
+                
+                    total_loss = ctc_loss
+
+
+                elif training_mode == "segmentation":
+                
+                    total_loss = segment_loss
+
+
+                elif training_mode == "joint":
+                
+                    total_loss = (
+                        CTC_LOSS_WEIGHT
+                        * ctc_loss
+                        +
+                        SEGMENT_LOSS_WEIGHT
+                        * segment_loss
+                    )
+
 
             # ========================================================
             # Backward pass
@@ -3283,6 +3479,7 @@ def train_model(
             # ========================================================
 
             train_progress.set_postfix(
+                mode=training_mode,
                 total=(
                     f"{total_loss.detach().item():.4f}"
                 ),
@@ -3362,13 +3559,30 @@ def train_model(
             / global_train_phoneme_count
         )
 
-        average_train_total_loss = (
-            CTC_LOSS_WEIGHT
-            * average_train_ctc_loss
-            +
-            SEGMENT_LOSS_WEIGHT
-            * average_train_segment_loss
-        )
+        if training_mode == "ctc":
+
+            average_train_total_loss = (
+                average_train_ctc_loss
+            )
+
+
+        elif training_mode == "segmentation":
+        
+            average_train_total_loss = (
+                average_train_segment_loss
+            )
+
+
+        elif training_mode == "joint":
+        
+            average_train_total_loss = (
+                CTC_LOSS_WEIGHT
+                * average_train_ctc_loss
+                +
+                SEGMENT_LOSS_WEIGHT
+                * average_train_segment_loss
+            )
+
 
         train_metrics = {
             "total_loss": (
@@ -3420,20 +3634,30 @@ def train_model(
         if epoch < warmup_epochs:
 
             warmup_scheduler.step()
-
-            active_scheduler = (
-                "warmup"
-            )
-
-        else:
-
+        
+            active_scheduler = "warmup"
+        
+        
+        elif training_mode in {
+            "ctc",
+            "joint",
+        }:
+        
             plateau_scheduler.step(
                 validation_per
             )
-
-            active_scheduler = (
-                "plateau"
-            )
+        
+            active_scheduler = "plateau"
+        
+        
+        else:
+        
+            # Segmentation-only:
+            # CTC PER is not a valid scheduler metric
+            # because the CTC system is frozen.
+            active_scheduler = "none"
+        
+        
 
         # ============================================================
         # Best model
@@ -3557,7 +3781,7 @@ def train_model(
             print()
             print("=" * 78)
             print(
-                f"Epoch {epoch + 1}/{epochs}"
+                f"Epoch {epoch + 1}/{end_epoch}"
             )
             print("=" * 78)
 
@@ -3746,6 +3970,43 @@ def train_model(
                     f"{group['lr']:.8g}"
                 )
 
+
+            print()
+            print("GPU memory usage")
+            print("-" * 40)
+
+            if torch.cuda.is_available():
+                peak_allocated_gb = (
+                    torch.cuda.max_memory_allocated()
+                    / 1024**3
+                )
+
+                peak_reserved_gb = (
+                    torch.cuda.max_memory_reserved()
+                    / 1024**3
+                )
+
+                total_memory_gb = (
+                    torch.cuda.get_device_properties(0).total_memory
+                    / 1024**3
+                )
+
+                print(
+                    f"GPU memory allocated : "
+                    f"{peak_allocated_gb:.2f} GB"
+                )
+
+                print(
+                    f"GPU memory reserved  : "
+                    f"{peak_reserved_gb:.2f} GB"
+                )
+
+                print(
+                    f"GPU total memory     : "
+                    f"{total_memory_gb:.2f} GB"
+                )
+
+
             print("=" * 78)
             print()
 
@@ -3845,974 +4106,980 @@ best_validation_per = train_model(
     warmup_scheduler=warmup_scheduler,
     plateau_scheduler=plateau_scheduler,
     accelerator=accelerator,
-    epochs= NUM_EPOCHS,
+
+    epochs=NUM_EPOCHS,
+    start_epoch=start_epoch,
+
     warmup_epochs=WARMUP_EPOCHS,
     best_validation_per=best_validation_per,
+
     working_model_path=WORKING_MODEL_PATH,
     working_best_model_path=WORKING_BEST_MODEL_PATH,
+
+    training_mode="ctc",
 )
 
 # %%
-# def align_phoneme_sequences(
-#     reference,
-#     hypothesis,
-# ):
-#     """
-#     Levenshtein alignment.
+def align_phoneme_sequences(
+    reference,
+    hypothesis,
+):
+    """
+    Levenshtein alignment.
 
-#     Returns an aligned sequence of operations:
-#         match
-#         substitute
-#         delete
-#         insert
-#     """
+    Returns an aligned sequence of operations:
+        match
+        substitute
+        delete
+        insert
+    """
 
-#     reference = list(reference)
-#     hypothesis = list(hypothesis)
+    reference = list(reference)
+    hypothesis = list(hypothesis)
 
-#     reference_length = len(reference)
-#     hypothesis_length = len(hypothesis)
+    reference_length = len(reference)
+    hypothesis_length = len(hypothesis)
 
-#     costs = [
-#         [0] * (hypothesis_length + 1)
-#         for _ in range(reference_length + 1)
-#     ]
+    costs = [
+        [0] * (hypothesis_length + 1)
+        for _ in range(reference_length + 1)
+    ]
 
-#     operations = [
-#         [None] * (hypothesis_length + 1)
-#         for _ in range(reference_length + 1)
-#     ]
+    operations = [
+        [None] * (hypothesis_length + 1)
+        for _ in range(reference_length + 1)
+    ]
 
-#     for reference_index in range(
-#         1,
-#         reference_length + 1,
-#     ):
-#         costs[reference_index][0] = (
-#             reference_index
-#         )
+    for reference_index in range(
+        1,
+        reference_length + 1,
+    ):
+        costs[reference_index][0] = (
+            reference_index
+        )
 
-#         operations[reference_index][0] = (
-#             "delete"
-#         )
+        operations[reference_index][0] = (
+            "delete"
+        )
 
-#     for hypothesis_index in range(
-#         1,
-#         hypothesis_length + 1,
-#     ):
-#         costs[0][hypothesis_index] = (
-#             hypothesis_index
-#         )
+    for hypothesis_index in range(
+        1,
+        hypothesis_length + 1,
+    ):
+        costs[0][hypothesis_index] = (
+            hypothesis_index
+        )
 
-#         operations[0][hypothesis_index] = (
-#             "insert"
-#         )
+        operations[0][hypothesis_index] = (
+            "insert"
+        )
 
-#     for reference_index in range(
-#         1,
-#         reference_length + 1,
-#     ):
-#         for hypothesis_index in range(
-#             1,
-#             hypothesis_length + 1,
-#         ):
-#             reference_phoneme = reference[
-#                 reference_index - 1
-#             ]
+    for reference_index in range(
+        1,
+        reference_length + 1,
+    ):
+        for hypothesis_index in range(
+            1,
+            hypothesis_length + 1,
+        ):
+            reference_phoneme = reference[
+                reference_index - 1
+            ]
 
-#             hypothesis_phoneme = hypothesis[
-#                 hypothesis_index - 1
-#             ]
+            hypothesis_phoneme = hypothesis[
+                hypothesis_index - 1
+            ]
 
-#             if (
-#                 reference_phoneme
-#                 == hypothesis_phoneme
-#             ):
-#                 costs[
-#                     reference_index
-#                 ][
-#                     hypothesis_index
-#                 ] = costs[
-#                     reference_index - 1
-#                 ][
-#                     hypothesis_index - 1
-#                 ]
+            if (
+                reference_phoneme
+                == hypothesis_phoneme
+            ):
+                costs[
+                    reference_index
+                ][
+                    hypothesis_index
+                ] = costs[
+                    reference_index - 1
+                ][
+                    hypothesis_index - 1
+                ]
 
-#                 operations[
-#                     reference_index
-#                 ][
-#                     hypothesis_index
-#                 ] = "match"
+                operations[
+                    reference_index
+                ][
+                    hypothesis_index
+                ] = "match"
 
-#                 continue
+                continue
 
-#             substitution_cost = (
-#                 costs[
-#                     reference_index - 1
-#                 ][
-#                     hypothesis_index - 1
-#                 ]
-#                 + 1
-#             )
+            substitution_cost = (
+                costs[
+                    reference_index - 1
+                ][
+                    hypothesis_index - 1
+                ]
+                + 1
+            )
 
-#             deletion_cost = (
-#                 costs[
-#                     reference_index - 1
-#                 ][
-#                     hypothesis_index
-#                 ]
-#                 + 1
-#             )
+            deletion_cost = (
+                costs[
+                    reference_index - 1
+                ][
+                    hypothesis_index
+                ]
+                + 1
+            )
 
-#             insertion_cost = (
-#                 costs[
-#                     reference_index
-#                 ][
-#                     hypothesis_index - 1
-#                 ]
-#                 + 1
-#             )
+            insertion_cost = (
+                costs[
+                    reference_index
+                ][
+                    hypothesis_index - 1
+                ]
+                + 1
+            )
 
-#             minimum_cost = min(
-#                 substitution_cost,
-#                 deletion_cost,
-#                 insertion_cost,
-#             )
+            minimum_cost = min(
+                substitution_cost,
+                deletion_cost,
+                insertion_cost,
+            )
 
-#             costs[
-#                 reference_index
-#             ][
-#                 hypothesis_index
-#             ] = minimum_cost
+            costs[
+                reference_index
+            ][
+                hypothesis_index
+            ] = minimum_cost
 
-#             if (
-#                 minimum_cost
-#                 == substitution_cost
-#             ):
-#                 operations[
-#                     reference_index
-#                 ][
-#                     hypothesis_index
-#                 ] = "substitute"
+            if (
+                minimum_cost
+                == substitution_cost
+            ):
+                operations[
+                    reference_index
+                ][
+                    hypothesis_index
+                ] = "substitute"
 
-#             elif (
-#                 minimum_cost
-#                 == deletion_cost
-#             ):
-#                 operations[
-#                     reference_index
-#                 ][
-#                     hypothesis_index
-#                 ] = "delete"
+            elif (
+                minimum_cost
+                == deletion_cost
+            ):
+                operations[
+                    reference_index
+                ][
+                    hypothesis_index
+                ] = "delete"
 
-#             else:
-#                 operations[
-#                     reference_index
-#                 ][
-#                     hypothesis_index
-#                 ] = "insert"
+            else:
+                operations[
+                    reference_index
+                ][
+                    hypothesis_index
+                ] = "insert"
 
-#     alignment = []
+    alignment = []
 
-#     reference_index = reference_length
-#     hypothesis_index = hypothesis_length
+    reference_index = reference_length
+    hypothesis_index = hypothesis_length
 
-#     while (
-#         reference_index > 0
-#         or hypothesis_index > 0
-#     ):
-#         operation = operations[
-#             reference_index
-#         ][
-#             hypothesis_index
-#         ]
+    while (
+        reference_index > 0
+        or hypothesis_index > 0
+    ):
+        operation = operations[
+            reference_index
+        ][
+            hypothesis_index
+        ]
 
-#         if operation == "match":
-#             alignment.append(
-#                 {
-#                     "operation": "match",
-#                     "reference_index": (
-#                         reference_index - 1
-#                     ),
-#                     "hypothesis_index": (
-#                         hypothesis_index - 1
-#                     ),
-#                     "target_phoneme": reference[
-#                         reference_index - 1
-#                     ],
-#                     "predicted_phoneme": hypothesis[
-#                         hypothesis_index - 1
-#                     ],
-#                 }
-#             )
+        if operation == "match":
+            alignment.append(
+                {
+                    "operation": "match",
+                    "reference_index": (
+                        reference_index - 1
+                    ),
+                    "hypothesis_index": (
+                        hypothesis_index - 1
+                    ),
+                    "target_phoneme": reference[
+                        reference_index - 1
+                    ],
+                    "predicted_phoneme": hypothesis[
+                        hypothesis_index - 1
+                    ],
+                }
+            )
 
-#             reference_index -= 1
-#             hypothesis_index -= 1
+            reference_index -= 1
+            hypothesis_index -= 1
 
-#         elif operation == "substitute":
-#             alignment.append(
-#                 {
-#                     "operation": "substitute",
-#                     "reference_index": (
-#                         reference_index - 1
-#                     ),
-#                     "hypothesis_index": (
-#                         hypothesis_index - 1
-#                     ),
-#                     "target_phoneme": reference[
-#                         reference_index - 1
-#                     ],
-#                     "predicted_phoneme": hypothesis[
-#                         hypothesis_index - 1
-#                     ],
-#                 }
-#             )
+        elif operation == "substitute":
+            alignment.append(
+                {
+                    "operation": "substitute",
+                    "reference_index": (
+                        reference_index - 1
+                    ),
+                    "hypothesis_index": (
+                        hypothesis_index - 1
+                    ),
+                    "target_phoneme": reference[
+                        reference_index - 1
+                    ],
+                    "predicted_phoneme": hypothesis[
+                        hypothesis_index - 1
+                    ],
+                }
+            )
 
-#             reference_index -= 1
-#             hypothesis_index -= 1
+            reference_index -= 1
+            hypothesis_index -= 1
 
-#         elif operation == "delete":
-#             alignment.append(
-#                 {
-#                     "operation": "delete",
-#                     "reference_index": (
-#                         reference_index - 1
-#                     ),
-#                     "hypothesis_index": None,
-#                     "target_phoneme": reference[
-#                         reference_index - 1
-#                     ],
-#                     "predicted_phoneme": None,
-#                 }
-#             )
+        elif operation == "delete":
+            alignment.append(
+                {
+                    "operation": "delete",
+                    "reference_index": (
+                        reference_index - 1
+                    ),
+                    "hypothesis_index": None,
+                    "target_phoneme": reference[
+                        reference_index - 1
+                    ],
+                    "predicted_phoneme": None,
+                }
+            )
 
-#             reference_index -= 1
+            reference_index -= 1
 
-#         elif operation == "insert":
-#             alignment.append(
-#                 {
-#                     "operation": "insert",
-#                     "reference_index": None,
-#                     "hypothesis_index": (
-#                         hypothesis_index - 1
-#                     ),
-#                     "target_phoneme": None,
-#                     "predicted_phoneme": hypothesis[
-#                         hypothesis_index - 1
-#                     ],
-#                 }
-#             )
+        elif operation == "insert":
+            alignment.append(
+                {
+                    "operation": "insert",
+                    "reference_index": None,
+                    "hypothesis_index": (
+                        hypothesis_index - 1
+                    ),
+                    "target_phoneme": None,
+                    "predicted_phoneme": hypothesis[
+                        hypothesis_index - 1
+                    ],
+                }
+            )
 
-#             hypothesis_index -= 1
+            hypothesis_index -= 1
 
-#         else:
-#             raise RuntimeError(
-#                 "Invalid Levenshtein operation "
-#                 f"at ({reference_index}, "
-#                 f"{hypothesis_index})"
-#             )
+        else:
+            raise RuntimeError(
+                "Invalid Levenshtein operation "
+                f"at ({reference_index}, "
+                f"{hypothesis_index})"
+            )
 
-#     alignment.reverse()
+    alignment.reverse()
 
-#     substitutions = sum(
-#         item["operation"] == "substitute"
-#         for item in alignment
-#     )
+    substitutions = sum(
+        item["operation"] == "substitute"
+        for item in alignment
+    )
 
-#     deletions = sum(
-#         item["operation"] == "delete"
-#         for item in alignment
-#     )
+    deletions = sum(
+        item["operation"] == "delete"
+        for item in alignment
+    )
 
-#     insertions = sum(
-#         item["operation"] == "insert"
-#         for item in alignment
-#     )
+    insertions = sum(
+        item["operation"] == "insert"
+        for item in alignment
+    )
 
-#     matches = sum(
-#         item["operation"] == "match"
-#         for item in alignment
-#     )
+    matches = sum(
+        item["operation"] == "match"
+        for item in alignment
+    )
 
-#     return {
-#         "alignment": alignment,
-#         "matches": matches,
-#         "substitutions": substitutions,
-#         "deletions": deletions,
-#         "insertions": insertions,
-#         "total_errors": (
-#             substitutions
-#             + deletions
-#             + insertions
-#         ),
-#     }
+    return {
+        "alignment": alignment,
+        "matches": matches,
+        "substitutions": substitutions,
+        "deletions": deletions,
+        "insertions": insertions,
+        "total_errors": (
+            substitutions
+            + deletions
+            + insertions
+        ),
+    }
 
 # %%
-# def test_external_audio(
-#     audio_path,
-#     model,
-#     accelerator,
-#     id_to_phoneme,
-#     phoneme_to_id=None,
-#     correct_target=None,
-#     sample_rate=16000,
-#     print_result=True,
-# ):
-#     import ast
-#     import torch
-
-#     # ============================================================
-#     # Parse optional reference target
-#     # ============================================================
-
-#     if correct_target is not None:
-#         if isinstance(correct_target, str):
-#             target_text = correct_target.strip()
-
-#             if target_text.startswith("["):
-#                 correct_target = ast.literal_eval(
-#                     target_text
-#                 )
-#             else:
-#                 correct_target = (
-#                     target_text.split()
-#                 )
-
-#         if not isinstance(
-#             correct_target,
-#             (list, tuple),
-#         ):
-#             raise TypeError(
-#                 "correct_target must be None, "
-#                 "a list of phonemes, or a string"
-#             )
-
-#         correct_target = list(
-#             correct_target
-#         )
-
-#         if len(correct_target) == 0:
-#             raise ValueError(
-#                 "correct_target cannot be empty "
-#                 "when it is provided"
-#             )
-
-#         if phoneme_to_id is not None:
-#             unknown_phonemes = [
-#                 phoneme
-#                 for phoneme in correct_target
-#                 if phoneme not in phoneme_to_id
-#             ]
-
-#             if unknown_phonemes:
-#                 raise ValueError(
-#                     f"Unknown phonemes: "
-#                     f"{unknown_phonemes}"
-#                 )
-
-#     # ============================================================
-#     # Load audio
-#     # ============================================================
-
-#     waveform = load_waveform(
-#         audio_path=audio_path,
-#         sr=sample_rate,
-#         training=False,
-#     )
-
-#     original_num_samples = int(
-#         waveform.shape[0]
-#     )
-
-#     audio_duration_seconds = (
-#         original_num_samples
-#         / sample_rate
-#     )
-
-#     waveform_batch = (
-#         waveform
-#         .unsqueeze(0)
-#         .to(accelerator.device)
-#     )
-
-#     input_lengths = torch.tensor(
-#         [original_num_samples],
-#         dtype=torch.long,
-#         device=accelerator.device,
-#     )
-
-#     # ============================================================
-#     # Autonomous inference
-#     # ============================================================
-
-#     model.eval()
-
-#     with torch.inference_mode():
-#         with accelerator.autocast():
-#             (
-#                 logits_batch,
-#                 segment_lengths,
-#                 hard_boundaries_batch,
-#                 hidden_lengths,
-#                 raw_predicted_counts,
-#                 predicted_lengths,
-#             ) = model(
-#                 waveform_batch,
-#                 input_lengths,
-#             )
-
-#     # Important:
-#     # no target length was passed into the model.
-
-#     logits = logits_batch[0].float()
-
-#     probabilities = torch.softmax(
-#         logits,
-#         dim=-1,
-#     )
-
-#     (
-#         predicted_confidences,
-#         predicted_ids,
-#     ) = probabilities.max(
-#         dim=-1
-#     )
-
-#     predicted_ids = (
-#         predicted_ids
-#         .detach()
-#         .cpu()
-#     )
-
-#     predicted_confidences = (
-#         predicted_confidences
-#         .detach()
-#         .cpu()
-#     )
-
-#     hard_boundaries = (
-#         hard_boundaries_batch[0]
-#         .detach()
-#         .cpu()
-#     )
-
-#     soft_segment_masses = (
-#         segment_lengths[0]
-#         .detach()
-#         .cpu()
-#     )
-
-#     hidden_length = int(
-#         hidden_lengths[0].item()
-#     )
-
-#     raw_predicted_count = float(
-#         raw_predicted_counts[0]
-#         .float()
-#         .item()
-#     )
-
-#     predicted_count = int(
-#         predicted_lengths[0].item()
-#     )
-
-#     actual_output_count = int(
-#         predicted_ids.shape[0]
-#     )
-
-#     if actual_output_count != predicted_count:
-#         raise RuntimeError(
-#             "The predicted length does not match "
-#             "the number of output segments: "
-#             f"{predicted_count} versus "
-#             f"{actual_output_count}"
-#         )
-
-#     predicted_phonemes = [
-#         id_to_phoneme[
-#             int(phoneme_id.item())
-#         ]
-#         for phoneme_id in predicted_ids
-#     ]
-
-#     # ============================================================
-#     # Convert boundaries to time
-#     # ============================================================
-
-#     unwrapped_model = (
-#         accelerator.unwrap_model(model)
-#     )
-
-#     boundary_data = (
-#         unwrapped_model.boundaries_to_seconds(
-#             boundaries=hard_boundaries,
-#             input_length=original_num_samples,
-#             hidden_length=hidden_length,
-#             sample_rate=sample_rate,
-#         )
-#     )
-
-#     total_stride = 1
-
-#     for stride in unwrapped_model.conv_stride:
-#         total_stride *= stride
-
-#     nominal_frame_duration_seconds = (
-#         total_stride / sample_rate
-#     )
-
-#     # ============================================================
-#     # Build predicted segment information
-#     # ============================================================
-
-#     results = []
-
-#     for index in range(
-#         predicted_count
-#     ):
-#         predicted_id = int(
-#             predicted_ids[index].item()
-#         )
-
-#         predicted_phoneme = (
-#             id_to_phoneme[predicted_id]
-#         )
-
-#         boundary = boundary_data[index]
-
-#         start_frame = int(
-#             boundary["start_frame"]
-#         )
-
-#         end_frame = int(
-#             boundary["end_frame"]
-#         )
-
-#         frame_count = (
-#             end_frame - start_frame
-#         )
-
-#         segment_duration = float(
-#             boundary["duration_seconds"]
-#         )
-
-#         if frame_count > 0:
-#             average_frame_duration = (
-#                 segment_duration
-#                 / frame_count
-#             )
-#         else:
-#             average_frame_duration = 0.0
-
-#         result = {
-#             "index": index,
-#             "predicted_id": predicted_id,
-#             "predicted_phoneme": (
-#                 predicted_phoneme
-#             ),
-#             "confidence": float(
-#                 predicted_confidences[
-#                     index
-#                 ].item()
-#             ),
-#             "start_frame": start_frame,
-#             "end_frame": end_frame,
-#             "frame_count": frame_count,
-#             "start_sample": int(
-#                 boundary["start_sample"]
-#             ),
-#             "end_sample": int(
-#                 boundary["end_sample"]
-#             ),
-#             "start_seconds": float(
-#                 boundary["start_seconds"]
-#             ),
-#             "end_seconds": float(
-#                 boundary["end_seconds"]
-#             ),
-#             "duration_seconds": (
-#                 segment_duration
-#             ),
-#             "average_frame_duration_seconds": (
-#                 average_frame_duration
-#             ),
-#             "nominal_frame_duration_seconds": (
-#                 nominal_frame_duration_seconds
-#             ),
-#             "soft_segment_mass": float(
-#                 soft_segment_masses[
-#                     index
-#                 ].item()
-#             ),
-
-#             # Filled only when correct_target
-#             # is provided.
-#             "target_phoneme": None,
-#             "alignment_operation": None,
-#             "correct": None,
-#         }
-
-#         results.append(result)
-
-#     # ============================================================
-#     # Optional reference evaluation
-#     # ============================================================
-
-#     evaluation = None
-#     alignment = None
-
-#     if correct_target is not None:
-#         alignment_result = (
-#             align_phoneme_sequences(
-#                 reference=correct_target,
-#                 hypothesis=(
-#                     predicted_phonemes
-#                 ),
-#             )
-#         )
-
-#         alignment = alignment_result[
-#             "alignment"
-#         ]
-
-#         matches = alignment_result[
-#             "matches"
-#         ]
-
-#         substitutions = alignment_result[
-#             "substitutions"
-#         ]
-
-#         deletions = alignment_result[
-#             "deletions"
-#         ]
-
-#         insertions = alignment_result[
-#             "insertions"
-#         ]
-
-#         total_errors = alignment_result[
-#             "total_errors"
-#         ]
-
-#         reference_count = len(
-#             correct_target
-#         )
-
-#         alignment_length = (
-#             matches
-#             + substitutions
-#             + deletions
-#             + insertions
-#         )
-
-#         phoneme_error_rate = (
-#             total_errors
-#             / reference_count
-#         )
-
-#         reference_match_accuracy = (
-#             matches
-#             / reference_count
-#         )
-
-#         alignment_accuracy = (
-#             matches
-#             / max(
-#                 alignment_length,
-#                 1,
-#             )
-#         )
-
-#         exact_sequence = (
-#             total_errors == 0
-#         )
-
-#         count_error = abs(
-#             predicted_count
-#             - reference_count
-#         )
-
-#         evaluation = {
-#             "reference_count": (
-#                 reference_count
-#             ),
-#             "predicted_count": (
-#                 predicted_count
-#             ),
-#             "count_error": count_error,
-#             "count_is_exact": (
-#                 count_error == 0
-#             ),
-#             "matches": matches,
-#             "substitutions": (
-#                 substitutions
-#             ),
-#             "deletions": deletions,
-#             "insertions": insertions,
-#             "total_errors": (
-#                 total_errors
-#             ),
-#             "phoneme_error_rate": (
-#                 phoneme_error_rate
-#             ),
-#             "reference_match_accuracy": (
-#                 reference_match_accuracy
-#             ),
-#             "alignment_accuracy": (
-#                 alignment_accuracy
-#             ),
-#             "exact_sequence": (
-#                 exact_sequence
-#             ),
-#         }
-
-#         # Attach alignment results to the
-#         # corresponding predicted segment.
-#         for alignment_item in alignment:
-#             hypothesis_index = (
-#                 alignment_item[
-#                     "hypothesis_index"
-#                 ]
-#             )
-
-#             if hypothesis_index is None:
-#                 # Deletion has no predicted
-#                 # segment and therefore no boundary.
-#                 continue
-
-#             results[
-#                 hypothesis_index
-#             ][
-#                 "target_phoneme"
-#             ] = alignment_item[
-#                 "target_phoneme"
-#             ]
-
-#             results[
-#                 hypothesis_index
-#             ][
-#                 "alignment_operation"
-#             ] = alignment_item[
-#                 "operation"
-#             ]
-
-#             results[
-#                 hypothesis_index
-#             ][
-#                 "correct"
-#             ] = (
-#                 alignment_item["operation"]
-#                 == "match"
-#             )
-
-#     # ============================================================
-#     # Final output
-#     # ============================================================
-
-#     output = {
-#         "audio_path": audio_path,
-#         "sample_rate": sample_rate,
-#         "audio_samples": (
-#             original_num_samples
-#         ),
-#         "audio_duration_seconds": (
-#             audio_duration_seconds
-#         ),
-#         "encoder_frame_count": (
-#             hidden_length
-#         ),
-#         "nominal_frame_duration_seconds": (
-#             nominal_frame_duration_seconds
-#         ),
-#         "raw_predicted_count": (
-#             raw_predicted_count
-#         ),
-#         "predicted_count": (
-#             predicted_count
-#         ),
-#         "predicted_phonemes": (
-#             predicted_phonemes
-#         ),
-#         "correct_target": (
-#             correct_target
-#         ),
-#         "evaluation": evaluation,
-#         "alignment": alignment,
-#         "segments": results,
-#     }
-
-#     # ============================================================
-#     # Print
-#     # ============================================================
-
-#     if print_result:
-#         print()
-#         print(
-#             f"Audio: {audio_path}"
-#         )
-
-#         print(
-#             f"Audio duration: "
-#             f"{audio_duration_seconds:.3f} seconds"
-#         )
-
-#         print(
-#             f"Encoder frames: "
-#             f"{hidden_length}"
-#         )
-
-#         print(
-#             f"Raw predicted count: "
-#             f"{raw_predicted_count:.3f}"
-#         )
-
-#         print(
-#             f"Selected phoneme count: "
-#             f"{predicted_count}"
-#         )
-
-#         print(
-#             f"Nominal frame duration: "
-#             f"{nominal_frame_duration_seconds * 1000:.2f} ms"
-#         )
-
-#         if evaluation is not None:
-#             print()
-#             print("Reference evaluation")
-
-#             print(
-#                 f"Target count: "
-#                 f"{evaluation['reference_count']}"
-#             )
-
-#             print(
-#                 f"Count error: "
-#                 f"{evaluation['count_error']}"
-#             )
-
-#             print(
-#                 f"Matches: "
-#                 f"{evaluation['matches']}"
-#             )
-
-#             print(
-#                 f"Substitutions: "
-#                 f"{evaluation['substitutions']}"
-#             )
-
-#             print(
-#                 f"Deletions: "
-#                 f"{evaluation['deletions']}"
-#             )
-
-#             print(
-#                 f"Insertions: "
-#                 f"{evaluation['insertions']}"
-#             )
-
-#             print(
-#                 f"Phoneme error rate: "
-#                 f"{evaluation['phoneme_error_rate']:.2%}"
-#             )
-
-#             print(
-#                 f"Reference match accuracy: "
-#                 f"{evaluation['reference_match_accuracy']:.2%}"
-#             )
-
-#             print(
-#                 f"Alignment accuracy: "
-#                 f"{evaluation['alignment_accuracy']:.2%}"
-#             )
-
-#             print(
-#                 f"Exact sequence: "
-#                 f"{evaluation['exact_sequence']}"
-#             )
-
-#         print()
-#         print(
-#             "Predicted phoneme boundaries"
-#         )
-
-#         print("=" * 145)
-
-#         for result in results:
-#             if evaluation is None:
-#                 alignment_text = (
-#                     "not evaluated"
-#                 )
-
-#                 target_text = "-"
-#             else:
-#                 alignment_text = (
-#                     result[
-#                         "alignment_operation"
-#                     ]
-#                     or "insertion"
-#                 )
-
-#                 target_text = (
-#                     result["target_phoneme"]
-#                     if result["target_phoneme"]
-#                     is not None
-#                     else "-"
-#                 )
-
-#             print(
-#                 f"{result['index']:03d} | "
-#                 f"target={target_text:<9} | "
-#                 f"pred={result['predicted_phoneme']:<9} | "
-#                 f"{alignment_text:<11} | "
-#                 f"confidence={result['confidence']:.3f} | "
-#                 f"frames=["
-#                 f"{result['start_frame']:4d}, "
-#                 f"{result['end_frame']:4d}) | "
-#                 f"count={result['frame_count']:3d} | "
-#                 f"time=["
-#                 f"{result['start_seconds']:7.3f}, "
-#                 f"{result['end_seconds']:7.3f}) s | "
-#                 f"duration="
-#                 f"{result['duration_seconds']:6.3f} s | "
-#                 f"soft_mass="
-#                 f"{result['soft_segment_mass']:6.2f}"
-#             )
-
-#         print("=" * 145)
-
-#         if (
-#             evaluation is not None
-#             and evaluation["deletions"] > 0
-#         ):
-#             print()
-#             print(
-#                 "Deleted target phonemes:"
-#             )
-
-#             for alignment_item in alignment:
-#                 if (
-#                     alignment_item[
-#                         "operation"
-#                     ]
-#                     == "delete"
-#                 ):
-#                     print(
-#                         f"target index "
-#                         f"{alignment_item['reference_index']:03d} | "
-#                         f"phoneme="
-#                         f"{alignment_item['target_phoneme']}"
-#                     )
-
-#         if correct_target is not None:
-#             print()
-#             print("Correct target:")
-#             print(correct_target)
-
-#         print()
-#         print("Predicted phonemes:")
-#         print(predicted_phonemes)
-
-#     return output
+def test_external_audio(
+    audio_path,
+    model,
+    accelerator,
+    id_to_phoneme,
+    phoneme_to_id=None,
+    correct_target=None,
+    sample_rate=16000,
+    print_result=True,
+):
+    import ast
+    import torch
+
+    # ============================================================
+    # Parse optional reference target
+    # ============================================================
+
+    if correct_target is not None:
+        if isinstance(correct_target, str):
+            target_text = correct_target.strip()
+
+            if target_text.startswith("["):
+                correct_target = ast.literal_eval(
+                    target_text
+                )
+            else:
+                correct_target = (
+                    target_text.split()
+                )
+
+        if not isinstance(
+            correct_target,
+            (list, tuple),
+        ):
+            raise TypeError(
+                "correct_target must be None, "
+                "a list of phonemes, or a string"
+            )
+
+        correct_target = list(
+            correct_target
+        )
+
+        if len(correct_target) == 0:
+            raise ValueError(
+                "correct_target cannot be empty "
+                "when it is provided"
+            )
+
+        if phoneme_to_id is not None:
+            unknown_phonemes = [
+                phoneme
+                for phoneme in correct_target
+                if phoneme not in phoneme_to_id
+            ]
+
+            if unknown_phonemes:
+                raise ValueError(
+                    f"Unknown phonemes: "
+                    f"{unknown_phonemes}"
+                )
+
+    # ============================================================
+    # Load audio
+    # ============================================================
+
+    waveform = load_waveform(
+        audio_path=audio_path,
+        sr=sample_rate,
+        training=False,
+    )
+
+    original_num_samples = int(
+        waveform.shape[0]
+    )
+
+    audio_duration_seconds = (
+        original_num_samples
+        / sample_rate
+    )
+
+    waveform_batch = (
+        waveform
+        .unsqueeze(0)
+        .to(accelerator.device)
+    )
+
+    input_lengths = torch.tensor(
+        [original_num_samples],
+        dtype=torch.long,
+        device=accelerator.device,
+    )
+
+    # ============================================================
+    # Autonomous inference
+    # ============================================================
+
+    model.eval()
+
+    with torch.inference_mode():
+        with accelerator.autocast():
+            (
+                logits_batch,
+                segment_lengths,
+                hard_boundaries_batch,
+                hidden_lengths,
+                raw_predicted_counts,
+                predicted_lengths,
+            ) = model(
+                waveform_batch,
+                input_lengths,
+            )
+
+    # Important:
+    # no target length was passed into the model.
+
+    logits = logits_batch[0].float()
+
+    probabilities = torch.softmax(
+        logits,
+        dim=-1,
+    )
+
+    (
+        predicted_confidences,
+        predicted_ids,
+    ) = probabilities.max(
+        dim=-1
+    )
+
+    predicted_ids = (
+        predicted_ids
+        .detach()
+        .cpu()
+    )
+
+    predicted_confidences = (
+        predicted_confidences
+        .detach()
+        .cpu()
+    )
+
+    hard_boundaries = (
+        hard_boundaries_batch[0]
+        .detach()
+        .cpu()
+    )
+
+    soft_segment_masses = (
+        segment_lengths[0]
+        .detach()
+        .cpu()
+    )
+
+    hidden_length = int(
+        hidden_lengths[0].item()
+    )
+
+    raw_predicted_count = float(
+        raw_predicted_counts[0]
+        .float()
+        .item()
+    )
+
+    predicted_count = int(
+        predicted_lengths[0].item()
+    )
+
+    actual_output_count = int(
+        predicted_ids.shape[0]
+    )
+
+    if actual_output_count != predicted_count:
+        raise RuntimeError(
+            "The predicted length does not match "
+            "the number of output segments: "
+            f"{predicted_count} versus "
+            f"{actual_output_count}"
+        )
+
+    predicted_phonemes = [
+        id_to_phoneme[
+            int(phoneme_id.item())
+        ]
+        for phoneme_id in predicted_ids
+    ]
+
+    # ============================================================
+    # Convert boundaries to time
+    # ============================================================
+
+    unwrapped_model = (
+        accelerator.unwrap_model(model)
+    )
+
+    boundary_data = (
+        unwrapped_model.boundaries_to_seconds(
+            boundaries=hard_boundaries,
+            input_length=original_num_samples,
+            hidden_length=hidden_length,
+            sample_rate=sample_rate,
+        )
+    )
+
+    total_stride = 1
+
+    for stride in unwrapped_model.conv_stride:
+        total_stride *= stride
+
+    nominal_frame_duration_seconds = (
+        total_stride / sample_rate
+    )
+
+    # ============================================================
+    # Build predicted segment information
+    # ============================================================
+
+    results = []
+
+    for index in range(
+        predicted_count
+    ):
+        predicted_id = int(
+            predicted_ids[index].item()
+        )
+
+        predicted_phoneme = (
+            id_to_phoneme[predicted_id]
+        )
+
+        boundary = boundary_data[index]
+
+        start_frame = int(
+            boundary["start_frame"]
+        )
+
+        end_frame = int(
+            boundary["end_frame"]
+        )
+
+        frame_count = (
+            end_frame - start_frame
+        )
+
+        segment_duration = float(
+            boundary["duration_seconds"]
+        )
+
+        if frame_count > 0:
+            average_frame_duration = (
+                segment_duration
+                / frame_count
+            )
+        else:
+            average_frame_duration = 0.0
+
+        result = {
+            "index": index,
+            "predicted_id": predicted_id,
+            "predicted_phoneme": (
+                predicted_phoneme
+            ),
+            "confidence": float(
+                predicted_confidences[
+                    index
+                ].item()
+            ),
+            "start_frame": start_frame,
+            "end_frame": end_frame,
+            "frame_count": frame_count,
+            "start_sample": int(
+                boundary["start_sample"]
+            ),
+            "end_sample": int(
+                boundary["end_sample"]
+            ),
+            "start_seconds": float(
+                boundary["start_seconds"]
+            ),
+            "end_seconds": float(
+                boundary["end_seconds"]
+            ),
+            "duration_seconds": (
+                segment_duration
+            ),
+            "average_frame_duration_seconds": (
+                average_frame_duration
+            ),
+            "nominal_frame_duration_seconds": (
+                nominal_frame_duration_seconds
+            ),
+            "soft_segment_mass": float(
+                soft_segment_masses[
+                    index
+                ].item()
+            ),
+
+            # Filled only when correct_target
+            # is provided.
+            "target_phoneme": None,
+            "alignment_operation": None,
+            "correct": None,
+        }
+
+        results.append(result)
+
+    # ============================================================
+    # Optional reference evaluation
+    # ============================================================
+
+    evaluation = None
+    alignment = None
+
+    if correct_target is not None:
+        alignment_result = (
+            align_phoneme_sequences(
+                reference=correct_target,
+                hypothesis=(
+                    predicted_phonemes
+                ),
+            )
+        )
+
+        alignment = alignment_result[
+            "alignment"
+        ]
+
+        matches = alignment_result[
+            "matches"
+        ]
+
+        substitutions = alignment_result[
+            "substitutions"
+        ]
+
+        deletions = alignment_result[
+            "deletions"
+        ]
+
+        insertions = alignment_result[
+            "insertions"
+        ]
+
+        total_errors = alignment_result[
+            "total_errors"
+        ]
+
+        reference_count = len(
+            correct_target
+        )
+
+        alignment_length = (
+            matches
+            + substitutions
+            + deletions
+            + insertions
+        )
+
+        phoneme_error_rate = (
+            total_errors
+            / reference_count
+        )
+
+        reference_match_accuracy = (
+            matches
+            / reference_count
+        )
+
+        alignment_accuracy = (
+            matches
+            / max(
+                alignment_length,
+                1,
+            )
+        )
+
+        exact_sequence = (
+            total_errors == 0
+        )
+
+        count_error = abs(
+            predicted_count
+            - reference_count
+        )
+
+        evaluation = {
+            "reference_count": (
+                reference_count
+            ),
+            "predicted_count": (
+                predicted_count
+            ),
+            "count_error": count_error,
+            "count_is_exact": (
+                count_error == 0
+            ),
+            "matches": matches,
+            "substitutions": (
+                substitutions
+            ),
+            "deletions": deletions,
+            "insertions": insertions,
+            "total_errors": (
+                total_errors
+            ),
+            "phoneme_error_rate": (
+                phoneme_error_rate
+            ),
+            "reference_match_accuracy": (
+                reference_match_accuracy
+            ),
+            "alignment_accuracy": (
+                alignment_accuracy
+            ),
+            "exact_sequence": (
+                exact_sequence
+            ),
+        }
+
+        # Attach alignment results to the
+        # corresponding predicted segment.
+        for alignment_item in alignment:
+            hypothesis_index = (
+                alignment_item[
+                    "hypothesis_index"
+                ]
+            )
+
+            if hypothesis_index is None:
+                # Deletion has no predicted
+                # segment and therefore no boundary.
+                continue
+
+            results[
+                hypothesis_index
+            ][
+                "target_phoneme"
+            ] = alignment_item[
+                "target_phoneme"
+            ]
+
+            results[
+                hypothesis_index
+            ][
+                "alignment_operation"
+            ] = alignment_item[
+                "operation"
+            ]
+
+            results[
+                hypothesis_index
+            ][
+                "correct"
+            ] = (
+                alignment_item["operation"]
+                == "match"
+            )
+
+    # ============================================================
+    # Final output
+    # ============================================================
+
+    output = {
+        "audio_path": audio_path,
+        "sample_rate": sample_rate,
+        "audio_samples": (
+            original_num_samples
+        ),
+        "audio_duration_seconds": (
+            audio_duration_seconds
+        ),
+        "encoder_frame_count": (
+            hidden_length
+        ),
+        "nominal_frame_duration_seconds": (
+            nominal_frame_duration_seconds
+        ),
+        "raw_predicted_count": (
+            raw_predicted_count
+        ),
+        "predicted_count": (
+            predicted_count
+        ),
+        "predicted_phonemes": (
+            predicted_phonemes
+        ),
+        "correct_target": (
+            correct_target
+        ),
+        "evaluation": evaluation,
+        "alignment": alignment,
+        "segments": results,
+    }
+
+    # ============================================================
+    # Print
+    # ============================================================
+
+    if print_result:
+        print()
+        print(
+            f"Audio: {audio_path}"
+        )
+
+        print(
+            f"Audio duration: "
+            f"{audio_duration_seconds:.3f} seconds"
+        )
+
+        print(
+            f"Encoder frames: "
+            f"{hidden_length}"
+        )
+
+        print(
+            f"Raw predicted count: "
+            f"{raw_predicted_count:.3f}"
+        )
+
+        print(
+            f"Selected phoneme count: "
+            f"{predicted_count}"
+        )
+
+        print(
+            f"Nominal frame duration: "
+            f"{nominal_frame_duration_seconds * 1000:.2f} ms"
+        )
+
+        if evaluation is not None:
+            print()
+            print("Reference evaluation")
+
+            print(
+                f"Target count: "
+                f"{evaluation['reference_count']}"
+            )
+
+            print(
+                f"Count error: "
+                f"{evaluation['count_error']}"
+            )
+
+            print(
+                f"Matches: "
+                f"{evaluation['matches']}"
+            )
+
+            print(
+                f"Substitutions: "
+                f"{evaluation['substitutions']}"
+            )
+
+            print(
+                f"Deletions: "
+                f"{evaluation['deletions']}"
+            )
+
+            print(
+                f"Insertions: "
+                f"{evaluation['insertions']}"
+            )
+
+            print(
+                f"Phoneme error rate: "
+                f"{evaluation['phoneme_error_rate']:.2%}"
+            )
+
+            print(
+                f"Reference match accuracy: "
+                f"{evaluation['reference_match_accuracy']:.2%}"
+            )
+
+            print(
+                f"Alignment accuracy: "
+                f"{evaluation['alignment_accuracy']:.2%}"
+            )
+
+            print(
+                f"Exact sequence: "
+                f"{evaluation['exact_sequence']}"
+            )
+
+        print()
+        print(
+            "Predicted phoneme boundaries"
+        )
+
+        print("=" * 145)
+
+        for result in results:
+            if evaluation is None:
+                alignment_text = (
+                    "not evaluated"
+                )
+
+                target_text = "-"
+            else:
+                alignment_text = (
+                    result[
+                        "alignment_operation"
+                    ]
+                    or "insertion"
+                )
+
+                target_text = (
+                    result["target_phoneme"]
+                    if result["target_phoneme"]
+                    is not None
+                    else "-"
+                )
+
+            print(
+                f"{result['index']:03d} | "
+                f"target={target_text:<9} | "
+                f"pred={result['predicted_phoneme']:<9} | "
+                f"{alignment_text:<11} | "
+                f"confidence={result['confidence']:.3f} | "
+                f"frames=["
+                f"{result['start_frame']:4d}, "
+                f"{result['end_frame']:4d}) | "
+                f"count={result['frame_count']:3d} | "
+                f"time=["
+                f"{result['start_seconds']:7.3f}, "
+                f"{result['end_seconds']:7.3f}) s | "
+                f"duration="
+                f"{result['duration_seconds']:6.3f} s | "
+                f"soft_mass="
+                f"{result['soft_segment_mass']:6.2f}"
+            )
+
+        print("=" * 145)
+
+        if (
+            evaluation is not None
+            and evaluation["deletions"] > 0
+        ):
+            print()
+            print(
+                "Deleted target phonemes:"
+            )
+
+            for alignment_item in alignment:
+                if (
+                    alignment_item[
+                        "operation"
+                    ]
+                    == "delete"
+                ):
+                    print(
+                        f"target index "
+                        f"{alignment_item['reference_index']:03d} | "
+                        f"phoneme="
+                        f"{alignment_item['target_phoneme']}"
+                    )
+
+        if correct_target is not None:
+            print()
+            print("Correct target:")
+            print(correct_target)
+
+        print()
+        print("Predicted phonemes:")
+        print(predicted_phonemes)
+
+    return output
 
 # %%
 # import numpy as np
