@@ -62,6 +62,30 @@ NUM_EPOCHS = 8
 
 DEVICE
 
+# %% [markdown]
+# # ============================================================
+# # Tajweed-Aware Phoneme Vocabulary
+# # ============================================================
+# #
+# # Defines the phoneme set used by the model:
+# # - Arabic consonants
+# # - short/long vowels and Tanween
+# # - consonant-vowel combinations
+# # - special Tajweed tokens for Ikhfaa, Qalqalah and Ghunnah
+# #
+# # Examples:
+# #   مَ  -> ma
+# #   مَا -> maa
+# #   qK  -> Qalqalah form of ق
+# #   nn  -> prolonged / Ghunnah-related ن
+# #
+# # PHONEME_BASE_TO_ARABIC is used only for readable Arabic display.
+# #
+# # Each phoneme is mapped to an integer ID using phoneme_to_id.
+# # CTC reserves ID 0 for <blank>, so normal phoneme IDs are shifted
+# # by +1 during CTC training and shifted back after decoding.
+# # ============================================================
+
 # %%
 SILENT_TOKEN = "<sil>"
 
@@ -130,6 +154,42 @@ BASE_CONSONANTS: List[str] = [
     "T",
 ]
 
+PHONEME_BASE_TO_ARABIC = {
+    "ʔ": "ء",
+    "b": "ب",
+    "t": "ت",
+    "θ": "ث",
+    "j": "ج",
+    "ħ": "ح",
+    "x": "خ",
+    "d": "د",
+    "ð": "ذ",
+    "r": "ر",
+    "rM": "ر",
+    "z": "ز",
+    "s": "س",
+    "ʃ": "ش",
+    "sˤ": "ص",
+    "dˤ": "ض",
+    "tˤ": "ط",
+    "ðˤ": "ظ",
+    "ʕ": "ع",
+    "ɣ": "غ",
+    "f": "ف",
+    "q": "ق",
+    "k": "ك",
+    "l": "ل",
+    "m": "م",
+    "n": "ن",
+    "h": "ه",
+    "w": "و",
+    "y": "ي",
+    "T": "ة",
+
+    "<sil>": "صمت",
+}
+
+
 
 # Generate all CV combinations
 CV_TOKENS = [
@@ -164,6 +224,42 @@ CTC_VOCAB_SIZE = len(phoneme_to_id) + 1
 
 # %%
 len(phoneme_to_id)
+
+# %% [markdown]
+# # ============================================================
+# # Audio Loading and Data Augmentation
+# # ============================================================
+# #
+# # This block prepares raw audio before passing it to the model.
+# #
+# # Main steps:
+# # - Load audio with torchaudio, with librosa as a fallback.
+# # - Convert stereo audio to mono and resample to 16 kHz.
+# # - Validate the waveform and reject empty/corrupted audio.
+# #
+# # During training only, random augmentation is applied:
+# #   • Speed perturbation   -> simulates slightly faster/slower recitation.
+# #   • Reverberation        -> simulates room, mosque, or distant microphone acoustics.
+# #   • Gaussian noise       -> adds controlled noise using a selected SNR.
+# #   • Random gain          -> changes recording loudness.
+# #
+# # Example:
+# #
+# #   Original audio
+# #        ↓
+# #   Speed change
+# #        ↓
+# #   Room reverb
+# #        ↓
+# #   Background noise
+# #        ↓
+# #   Normalize + random gain
+# #        ↓
+# #   Final waveform (16 kHz)
+# #
+# # These augmentations increase speaker/environment variation and help
+# # the model generalize to recordings that were not seen during training.
+# # ============================================================
 
 # %%
 @contextlib.contextmanager
@@ -1001,6 +1097,36 @@ def load_waveform(
     )
 
 
+# %% [markdown]
+# # ============================================================
+# # Dynamic Batch Sampler
+# # ============================================================
+# #
+# # This sampler groups audio recordings with similar lengths into
+# # dynamic batches while keeping the total padded audio size under
+# # a fixed memory budget.
+# #
+# # For each recording:
+# #   duration (sec) -> estimated number of samples
+# #
+# # The estimated length also considers possible speed perturbation,
+# # so slower augmented audio is still handled safely.
+# #
+# # Example:
+# #   lengths = [3s, 3.5s, 4s, 20s]
+# #
+# # Short recordings can be placed in the same batch, while a very
+# # long recording may be placed alone.
+# #
+# # Batch size is therefore not fixed:
+# #
+# #   short audio -> larger batch
+# #   long audio  -> smaller batch
+# #
+# # This reduces unnecessary padding, improves GPU utilization,
+# # and helps prevent CUDA out-of-memory errors.
+# # ============================================================
+
 # %%
 class DynamicBatchSampler(
     torch.utils.data.Sampler
@@ -1251,6 +1377,30 @@ class DynamicBatchSampler(
             self._build_batches()
         )
 
+# %% [markdown]
+# # ============================================================
+# # Dataset Preparation
+# # ============================================================
+# #
+# # This dataset class connects each audio recording with its
+# # corresponding phoneme sequence.
+# #
+# # For every sample, it:
+# # - selects the correct audio folder using ds_index,
+# # - loads and preprocesses the waveform,
+# # - converts the phoneme sequence from text to phoneme IDs,
+# # - checks that all phonemes exist in the vocabulary,
+# # - returns the waveform and target sequence with their lengths.
+# #
+# # Example:
+# #   phonemes = ["ma", "la", "ka"]
+# #        ↓
+# #   target IDs = [id(ma), id(la), id(ka)]
+# #
+# # Returned values:
+# #   waveform, target_ids, audio_length, target_length
+# # ============================================================
+
 # %%
 class TajweedCTCDataset(Dataset):
 
@@ -1309,6 +1459,29 @@ class TajweedCTCDataset(Dataset):
             waveform.shape[0],
             len(target_ids),
         )
+
+# %% [markdown]
+# # ============================================================
+# # Batch Padding and CTC Decoding
+# # ============================================================
+# #
+# # ctc_collate() prepares variable-length samples for batching:
+# # - audio waveforms are padded to the longest waveform,
+# # - target phoneme sequences are padded with -100,
+# # - original audio and target lengths are preserved.
+# #
+# # greedy_ctc_decode() converts frame-level CTC predictions into
+# # the final phoneme sequence by:
+# #   1. taking the highest-probability class at each frame,
+# #   2. collapsing consecutive repeated predictions,
+# #   3. removing the CTC <blank> token,
+# #   4. shifting CTC IDs back to normal phoneme IDs.
+# #
+# # Example:
+# #   CTC output: [blank, ma, ma, blank, la, la, blank]
+# #        ↓
+# #   Decoded sequence: [ma, la]
+# # ============================================================
 
 # %%
 def ctc_collate(batch):
@@ -1405,6 +1578,33 @@ def greedy_ctc_decode(
     return decoded_batch
 
 
+# %% [markdown]
+# # ============================================================
+# # SpecAugment for Tajweed-Aware Acoustic Features
+# # ============================================================
+# #
+# # Applies mild augmentation directly to the acoustic feature map
+# # during training by masking small time and frequency regions.
+# #
+# # Small masks are used intentionally to avoid destroying:
+# # - Madd duration information,
+# # - short-vowel timing,
+# # - emphatic and nasal spectral characteristics.
+# #
+# # Input shape:
+# #   (Batch, Time, Features)
+# #
+# # Example:
+# #   original features
+# #        ↓
+# #   small time masks + small frequency masks
+# #        ↓
+# #   slightly corrupted features
+# #
+# # This improves robustness while preserving important Tajweed cues.
+# # During evaluation, SpecAugment is disabled automatically.
+# # ============================================================
+
 # %%
 class SpecAugment(nn.Module):
     """
@@ -1449,6 +1649,27 @@ class SpecAugment(nn.Module):
 
         return x
 
+# %% [markdown]
+# # ============================================================
+# # Segment Classifier
+# # ============================================================
+# #
+# # Classifies each segmented phoneme embedding into one class
+# # from the phoneme vocabulary.
+# #
+# # Input:
+# #   segment embedding -> (embedding_dim)
+# #
+# # Output:
+# #   class scores -> (vocab_size)
+# #
+# # Example:
+# #   segment embedding -> classifier -> "ma"
+# #
+# # This classifier is used as an auxiliary training signal to help
+# # the segmentation module learn phoneme-discriminative segments.
+# # ============================================================
+
 # %%
 class SegmentClassifier(nn.Module):
     def __init__(self, embedding_dim=64, vocab_size=len(phoneme_to_id)):
@@ -1457,6 +1678,33 @@ class SegmentClassifier(nn.Module):
 
     def forward(self, x):
         return self.classifier(x)
+
+# %% [markdown]
+# # ============================================================
+# # Segmentation Head
+# # ============================================================
+# #
+# # Converts each Conformer frame into a smaller segment embedding,
+# # then predicts one positive weight for every time frame.
+# #
+# # Shapes:
+# #   Input hidden features     : (B, T, 512)
+# #   Segment embeddings       : (B, T, 64)
+# #   Progress weights         : (B, T)
+# #
+# # The progress weights are forced to be positive using Softplus.
+# # Their cumulative values are later used to divide the full audio
+# # sequence into ordered phoneme segments.
+# #
+# # Example:
+# #   Conformer frames
+# #        ↓
+# #   64-D segment embeddings
+# #        ↓
+# #   positive progress weights
+# #        ↓
+# #   phoneme boundaries
+# # ============================================================
 
 # %%
 class SegmentationHead(nn.Module):
@@ -1494,6 +1742,40 @@ class SegmentationHead(nn.Module):
         weights = F.softplus(weights)
 
         return segment_embedding, weights
+
+# %% [markdown]
+# # ============================================================
+# # ASR Model: Recognition + Segmentation
+# # ============================================================
+# #
+# # This is the complete model pipeline:
+# #
+# #   Audio
+# #     ↓
+# #   Wav2Vec2 feature extractor
+# #     ↓
+# #   Conformer
+# #     ├── CTC head → phoneme sequence
+# #     └── Segmentation head → phoneme boundaries
+# #
+# # During training:
+# # - the true phoneme count is used to build the segments,
+# # - the segment classifier helps train the segmentation branch.
+# #
+# # During inference:
+# # - CTC predicts the phoneme sequence,
+# # - its predicted length N is used to create N ordered segments.
+# #
+# # build_segments() converts learned progress weights into soft
+# # frame-to-segment assignments, pools each segment embedding,
+# # and extracts hard start/end boundaries.
+# #
+# # boundaries_to_seconds() converts encoder-frame boundaries into
+# # real audio times in seconds.
+# #
+# # Final result:
+# #   predicted phonemes + corresponding temporal boundaries.
+# # ============================================================
 
 # %%
 class ASRModel(torch.nn.Module):
@@ -2234,6 +2516,29 @@ def load_checkpoint(
         "checkpoint": checkpoint,
     }
 
+# %% [markdown]
+# # ============================================================
+# # Training Setup and Optimizer Configuration
+# # ============================================================
+# #
+# # This block prepares the model for GPU training using Hugging Face
+# # Accelerate with FP16 mixed precision.
+# #
+# # Different learning rates are assigned to each model component:
+# #   Wav2Vec2          -> very small LR for careful fine-tuning
+# #   Conformer         -> moderate LR
+# #   Segmentation head -> larger LR
+# #   Segment classifier-> larger LR
+# #   CTC head          -> larger LR
+# #
+# # Training starts with a 5-epoch linear warmup, then
+# # ReduceLROnPlateau lowers the learning rate when validation PER
+# # stops improving.
+# #
+# # If a checkpoint exists, model/optimizer/scheduler states and the
+# # previous epoch are restored; otherwise training starts from scratch.
+# # ============================================================
+
 # %%
 ddp_kwargs = DistributedDataParallelKwargs(find_unused_parameters=True)
 accelerator = Accelerator(mixed_precision="fp16", kwargs_handlers=[ddp_kwargs])
@@ -2339,6 +2644,37 @@ else:
     print("Starting fresh training")
     best_validation_per = float("inf")
     start_epoch = 0
+
+# %% [markdown]
+# # ============================================================
+# # Training Loss Functions
+# # ============================================================
+# #
+# # segmentation_loss():
+# # Measures how well each pooled segment is classified as its
+# # correct phoneme using Cross-Entropy Loss with small label smoothing.
+# #
+# #   segment logits + target phoneme IDs
+# #                 ↓
+# #          classification loss
+# #
+# # compute_ctc_loss():
+# # Measures how well the frame-level CTC output matches the target
+# # phoneme sequence without requiring exact frame-to-phoneme alignment.
+# #
+# # CTC expects:
+# #   logits shape: (T, B, C)
+# #
+# # Normal phoneme IDs are shifted by +1 because:
+# #   CTC ID 0 = <blank>
+# #
+# # Example:
+# #   phoneme ID 5 -> CTC target ID 6
+# #
+# # The two losses train different objectives:
+# #   CTC loss          -> phoneme recognition
+# #   Segmentation loss -> learning meaningful phoneme segments
+# # ============================================================
 
 # %%
 def segmentation_loss(
@@ -2448,6 +2784,34 @@ def compute_ctc_loss(
 
 # %%
 model
+
+# %% [markdown]
+# # ============================================================
+# # Levenshtein Error Analysis
+# # ============================================================
+# #
+# # Compares the predicted phoneme sequence with the reference
+# # sequence using Levenshtein distance.
+# #
+# # It counts four possible alignment operations:
+# #   match        -> correct phoneme
+# #   substitute   -> wrong phoneme
+# #   delete       -> missing phoneme
+# #   insert       -> extra phoneme
+# #
+# # Example:
+# #   Reference : [ma, la, ka]
+# #   Prediction: [ma, na, ka, ta]
+# #
+# # Result:
+# #   matches = 2
+# #   substitutions = 1
+# #   insertions = 1
+# #   deletions = 0
+# #
+# # These counts are later used to calculate PER
+# # (Phoneme Error Rate).
+# # ============================================================
 
 # %%
 def levenshtein_counts(
@@ -2652,6 +3016,34 @@ def levenshtein_counts(
         "insertions": insertions,
         "matches": matches,
     }
+
+# %% [markdown]
+# # ============================================================
+# # Model Evaluation
+# # ============================================================
+# #
+# # Evaluates the model using real inference, without providing
+# # the true phoneme count to the model.
+# #
+# # For every sample:
+# # - CTC predicts the phoneme sequence and its length,
+# # - the prediction is compared with the reference sequence,
+# # - Levenshtein operations are counted:
+# #     substitution, deletion, insertion, match.
+# #
+# # Main metrics:
+# #   PER = (substitutions + deletions + insertions)
+# #         / number of reference phonemes
+# #
+# #   Aligned match rate -> percentage of correctly matched phonemes
+# #   Exact sequence     -> percentage of fully correct sequences
+# #   Mean count error   -> average difference between predicted
+# #                         and true phoneme counts
+# #   Exact count        -> percentage of samples with correct count
+# #
+# # Statistics are reduced across all processes when distributed
+# # evaluation is used.
+# # ============================================================
 
 # %%
 @torch.inference_mode()
@@ -3010,6 +3402,32 @@ def evaluate_model(
 # %%
 CTC_LOSS_WEIGHT = 0.10
 SEGMENT_LOSS_WEIGHT = 1.0
+
+# %% [markdown]
+# # ============================================================
+# # Training Loop
+# # ============================================================
+# #
+# # Supports three training modes:
+# #   CTC          -> train phoneme recognition only
+# #   Segmentation -> train segmentation/classifier only
+# #   Joint        -> train both objectives together
+# #
+# # Frozen modules are kept in evaluation mode so dropout and
+# # augmentation do not change their representations.
+# #
+# # For each batch:
+# #   Audio -> Model -> CTC loss + Segmentation loss
+# #                 -> selected training objective
+# #                 -> Backpropagation -> Optimizer update
+# #
+# # After every epoch, the model is evaluated using PER and count
+# # metrics, learning-rate schedulers are updated, timing/GPU usage
+# # are reported, and the current/best checkpoints are saved.
+# #
+# # The validation stage always uses real inference:
+# # the true phoneme count is not provided to the model.
+# # ============================================================
 
 # %%
 def train_model(
@@ -4098,26 +4516,54 @@ def train_model(
 print("training is starting .......")
 
 # %%
-best_validation_per = train_model(
-    model=model,
-    train_loader=train_loader,
-    val_loader=val_loader,
-    optimizer=optimizer,
-    warmup_scheduler=warmup_scheduler,
-    plateau_scheduler=plateau_scheduler,
-    accelerator=accelerator,
+# best_validation_per = train_model(
+#     model=model,
+#     train_loader=train_loader,
+#     val_loader=val_loader,
+#     optimizer=optimizer,
+#     warmup_scheduler=warmup_scheduler,
+#     plateau_scheduler=plateau_scheduler,
+#     accelerator=accelerator,
 
-    epochs=NUM_EPOCHS,
-    start_epoch=start_epoch,
+#     epochs=NUM_EPOCHS,
+#     start_epoch=start_epoch,
 
-    warmup_epochs=WARMUP_EPOCHS,
-    best_validation_per=best_validation_per,
+#     warmup_epochs=WARMUP_EPOCHS,
+#     best_validation_per=best_validation_per,
 
-    working_model_path=WORKING_MODEL_PATH,
-    working_best_model_path=WORKING_BEST_MODEL_PATH,
+#     working_model_path=WORKING_MODEL_PATH,
+#     working_best_model_path=WORKING_BEST_MODEL_PATH,
 
-    training_mode="ctc",
-)
+#     training_mode="ctc",
+# )
+
+# %% [markdown]
+# # ============================================================
+# # Detailed Phoneme Sequence Alignment
+# # ============================================================
+# #
+# # Aligns the reference and predicted phoneme sequences using
+# # Levenshtein dynamic programming.
+# #
+# # Each aligned position is labeled as:
+# #   match        -> correct phoneme
+# #   substitute   -> wrong phoneme
+# #   delete       -> missing phoneme
+# #   insert       -> extra phoneme
+# #
+# # Example:
+# #   Reference : [ma, la, ka]
+# #   Prediction: [ma, na, ka, ta]
+# #
+# #   Alignment :
+# #   ma -> ma   (match)
+# #   la -> na   (substitute)
+# #   ka -> ka   (match)
+# #   -  -> ta   (insert)
+# #
+# # The function also keeps the reference/prediction indices so the
+# # aligned phonemes can later be connected with their time boundaries.
+# # ============================================================
 
 # %%
 def align_phoneme_sequences(
@@ -4414,6 +4860,164 @@ def align_phoneme_sequences(
     }
 
 # %%
+def phoneme_to_arabic_text(phoneme):
+    """
+    Convert one model phoneme token to a readable
+    Arabic representation.
+
+    This is for display only.
+    """
+
+    if phoneme is None:
+        return "-"
+
+    if phoneme == "<sil>":
+        return "صمت"
+
+    # ============================================================
+    # Special Tajweed tokens
+    # ============================================================
+
+    if phoneme == "nn":
+        return "نّ"
+
+    if phoneme == "mm":
+        return "مّ"
+
+    if phoneme == "yy":
+        return "يّ"
+
+    if phoneme == "ww":
+        return "وّ"
+
+    # ============================================================
+    # Find the consonant/base part.
+    #
+    # Longer tokens must be checked first:
+    # rM before r
+    # sˤ before s
+    # etc.
+    # ============================================================
+
+    base_tokens = sorted(
+        PHONEME_BASE_TO_ARABIC.keys(),
+        key=len,
+        reverse=True,
+    )
+
+    base = None
+    remainder = phoneme
+
+    for candidate in base_tokens:
+
+        if candidate == "<sil>":
+            continue
+
+        if phoneme.startswith(candidate):
+
+            base = candidate
+
+            remainder = phoneme[
+                len(candidate):
+            ]
+
+            break
+
+    # Pure vowel
+    if base is None:
+
+        vowel_map = {
+            "a": "َ",
+            "i": "ِ",
+            "u": "ُ",
+
+            "aa": "ا",
+            "ii": "ي",
+            "uu": "و",
+
+            "an": "ً",
+            "in": "ٍ",
+            "un": "ٌ",
+        }
+
+        return vowel_map.get(
+            phoneme,
+            phoneme,
+        )
+
+    arabic_letter = (
+        PHONEME_BASE_TO_ARABIC[
+            base
+        ]
+    )
+
+    # ============================================================
+    # Vowels
+    # ============================================================
+
+    suffix_map = {
+        "": "",
+
+        "a": "َ",
+        "i": "ِ",
+        "u": "ُ",
+
+        "aa": "َا",
+        "ii": "ِي",
+        "uu": "ُو",
+
+        "an": "ً",
+        "in": "ٍ",
+        "un": "ٌ",
+
+        # Qalqalah marker
+        "K": "ْ",
+    }
+
+    if remainder in suffix_map:
+
+        return (
+            arabic_letter
+            + suffix_map[
+                remainder
+            ]
+        )
+
+    # Tajweed-special tokens such as
+    # n + ikhfa letter.
+    return arabic_letter
+
+# %% [markdown]
+# # ============================================================
+# # Single-Audio Testing and Detailed Inference
+# # ============================================================
+# #
+# # Evaluates one external audio file using the final model pipeline:
+# #
+# #   Audio
+# #     ↓
+# #   Wav2Vec2 + Conformer
+# #     ↓
+# #   CTC phoneme prediction
+# #     ↓
+# #   predicted phoneme count
+# #     ↓
+# #   segmentation boundaries
+# #
+# # If a reference phoneme sequence is provided, the function:
+# # - aligns reference and prediction using Levenshtein alignment,
+# # - calculates PER, matches, substitutions, deletions and insertions,
+# # - reports missing/extra phonemes,
+# # - connects each predicted phoneme with its start/end time.
+# #
+# # It also converts encoder-frame boundaries into seconds and
+# # prints a detailed table containing:
+# #   target phoneme, predicted phoneme, Arabic display,
+# #   alignment result, start time, end time and duration.
+# # ============================================================
+
+# %%
+@torch.inference_mode()
 def test_external_audio(
     audio_path,
     model,
@@ -4424,15 +5028,43 @@ def test_external_audio(
     sample_rate=16000,
     print_result=True,
 ):
+    """
+    Evaluate one audio file using the FINAL architecture:
+
+        Audio
+          ↓
+        Wav2Vec2 + Conformer
+          ↓
+        CTC
+          ↓
+        predicted phoneme sequence
+          ↓
+        N = number of CTC phonemes
+          ↓
+        Segmentation head
+          ↓
+        N temporal boundaries
+
+    Final phoneme recognition comes ONLY from CTC.
+
+    The segment classifier is NOT used for final
+    phoneme prediction.
+
+    If correct_target is supplied, CTC recognition
+    is evaluated using Levenshtein alignment.
+    """
+
     import ast
     import torch
 
     # ============================================================
-    # Parse optional reference target
+    # 1. Parse optional reference
     # ============================================================
 
     if correct_target is not None:
+
         if isinstance(correct_target, str):
+
             target_text = correct_target.strip()
 
             if target_text.startswith("["):
@@ -4450,7 +5082,8 @@ def test_external_audio(
         ):
             raise TypeError(
                 "correct_target must be None, "
-                "a list of phonemes, or a string"
+                "a list/tuple of phonemes, "
+                "or a string."
             )
 
         correct_target = list(
@@ -4459,11 +5092,11 @@ def test_external_audio(
 
         if len(correct_target) == 0:
             raise ValueError(
-                "correct_target cannot be empty "
-                "when it is provided"
+                "correct_target cannot be empty."
             )
 
         if phoneme_to_id is not None:
+
             unknown_phonemes = [
                 phoneme
                 for phoneme in correct_target
@@ -4472,12 +5105,12 @@ def test_external_audio(
 
             if unknown_phonemes:
                 raise ValueError(
-                    f"Unknown phonemes: "
+                    f"Unknown reference phonemes: "
                     f"{unknown_phonemes}"
                 )
 
     # ============================================================
-    # Load audio
+    # 2. Load audio WITHOUT augmentation
     # ============================================================
 
     waveform = load_waveform(
@@ -4492,7 +5125,7 @@ def test_external_audio(
 
     audio_duration_seconds = (
         original_num_samples
-        / sample_rate
+        / float(sample_rate)
     )
 
     waveform_batch = (
@@ -4508,143 +5141,152 @@ def test_external_audio(
     )
 
     # ============================================================
-    # Autonomous inference
+    # 3. REAL autonomous inference
+    #
+    # IMPORTANT:
+    # target_lengths are NOT passed.
     # ============================================================
 
     model.eval()
 
-    with torch.inference_mode():
-        with accelerator.autocast():
-            (
-                logits_batch,
-                segment_lengths,
-                hard_boundaries_batch,
-                hidden_lengths,
-                raw_predicted_counts,
-                predicted_lengths,
-            ) = model(
-                waveform_batch,
-                input_lengths,
-            )
+    with accelerator.autocast():
 
-    # Important:
-    # no target length was passed into the model.
+        (
+            ctc_logits,
+            predicted_batch,
+            segment_lengths_batch,
+            hard_boundaries_batch,
+            hidden_lengths,
+            predicted_lengths,
+        ) = model(
+            waveform_batch,
+            input_lengths,
+        )
 
-    logits = logits_batch[0].float()
+    # ============================================================
+    # 4. CTC output
+    # ============================================================
 
-    probabilities = torch.softmax(
-        logits,
-        dim=-1,
+    predicted_ids = list(
+        predicted_batch[0]
     )
 
-    (
-        predicted_confidences,
-        predicted_ids,
-    ) = probabilities.max(
-        dim=-1
-    )
-
-    predicted_ids = (
+    # This is the REAL CTC count.
+    ctc_predicted_count = len(
         predicted_ids
-        .detach()
-        .cpu()
     )
 
-    predicted_confidences = (
-        predicted_confidences
-        .detach()
-        .cpu()
-    )
-
-    hard_boundaries = (
-        hard_boundaries_batch[0]
-        .detach()
-        .cpu()
-    )
-
-    soft_segment_masses = (
-        segment_lengths[0]
-        .detach()
-        .cpu()
-    )
+    predicted_phonemes = [
+        id_to_phoneme[
+            int(phoneme_id)
+        ]
+        for phoneme_id in predicted_ids
+    ]
 
     hidden_length = int(
         hidden_lengths[0].item()
     )
 
-    raw_predicted_count = float(
-        raw_predicted_counts[0]
-        .float()
-        .item()
-    )
+    # ============================================================
+    # 5. Segmentation output
+    # ============================================================
 
-    predicted_count = int(
-        predicted_lengths[0].item()
-    )
+    # Current model still uses max(N, 1) internally
+    # when CTC gives an empty sequence.
+    #
+    # Therefore, if CTC predicts N=0, ignore the
+    # artificial segmentation result.
+    # ============================================================
 
-    actual_output_count = int(
-        predicted_ids.shape[0]
-    )
+    if ctc_predicted_count == 0:
 
-    if actual_output_count != predicted_count:
-        raise RuntimeError(
-            "The predicted length does not match "
-            "the number of output segments: "
-            f"{predicted_count} versus "
-            f"{actual_output_count}"
+        hard_boundaries = torch.empty(
+            (0, 2),
+            dtype=torch.long,
         )
 
-    predicted_phonemes = [
-        id_to_phoneme[
-            int(phoneme_id.item())
-        ]
-        for phoneme_id in predicted_ids
-    ]
+        soft_segment_masses = torch.empty(
+            (0,),
+            dtype=torch.float32,
+        )
+
+    else:
+
+        hard_boundaries = (
+            hard_boundaries_batch[0]
+            .detach()
+            .cpu()
+        )
+
+        soft_segment_masses = (
+            segment_lengths_batch[0]
+            .detach()
+            .float()
+            .cpu()
+        )
+
+        # Safety check.
+        if (
+            hard_boundaries.shape[0]
+            != ctc_predicted_count
+        ):
+            raise RuntimeError(
+                "Segmentation count does not match "
+                "CTC decoded count. "
+                f"CTC={ctc_predicted_count}, "
+                f"segments="
+                f"{hard_boundaries.shape[0]}"
+            )
 
     # ============================================================
-    # Convert boundaries to time
+    # 6. Convert boundaries from frames to seconds
     # ============================================================
 
     unwrapped_model = (
         accelerator.unwrap_model(model)
     )
 
-    boundary_data = (
-        unwrapped_model.boundaries_to_seconds(
-            boundaries=hard_boundaries,
-            input_length=original_num_samples,
-            hidden_length=hidden_length,
-            sample_rate=sample_rate,
-        )
-    )
+    if ctc_predicted_count > 0:
 
+        boundary_data = (
+            unwrapped_model.boundaries_to_seconds(
+                boundaries=hard_boundaries,
+                input_length=original_num_samples,
+                hidden_length=hidden_length,
+                sample_rate=sample_rate,
+            )
+        )
+
+    else:
+
+        boundary_data = []
+
+    # Encoder nominal frame stride.
     total_stride = 1
 
-    for stride in unwrapped_model.conv_stride:
+    for stride in (
+        unwrapped_model.conv_stride
+    ):
         total_stride *= stride
 
     nominal_frame_duration_seconds = (
-        total_stride / sample_rate
+        total_stride
+        / float(sample_rate)
     )
 
     # ============================================================
-    # Build predicted segment information
+    # 7. Build phoneme + boundary results
     # ============================================================
 
-    results = []
+    segments = []
 
     for index in range(
-        predicted_count
+        ctc_predicted_count
     ):
-        predicted_id = int(
-            predicted_ids[index].item()
-        )
 
-        predicted_phoneme = (
-            id_to_phoneme[predicted_id]
-        )
-
-        boundary = boundary_data[index]
+        boundary = boundary_data[
+            index
+        ]
 
         start_frame = int(
             boundary["start_frame"]
@@ -4655,85 +5297,82 @@ def test_external_audio(
         )
 
         frame_count = (
-            end_frame - start_frame
+            end_frame
+            - start_frame
         )
 
-        segment_duration = float(
-            boundary["duration_seconds"]
+        duration_seconds = float(
+            boundary[
+                "duration_seconds"
+            ]
         )
 
-        if frame_count > 0:
-            average_frame_duration = (
-                segment_duration
-                / frame_count
-            )
-        else:
-            average_frame_duration = 0.0
-
-        result = {
+        segment = {
             "index": index,
-            "predicted_id": predicted_id,
+
+            # Final phoneme comes from CTC.
+            "predicted_id": int(
+                predicted_ids[index]
+            ),
+
             "predicted_phoneme": (
-                predicted_phoneme
+                predicted_phonemes[index]
             ),
-            "confidence": float(
-                predicted_confidences[
-                    index
-                ].item()
-            ),
+
             "start_frame": start_frame,
             "end_frame": end_frame,
             "frame_count": frame_count,
+
             "start_sample": int(
                 boundary["start_sample"]
             ),
+
             "end_sample": int(
                 boundary["end_sample"]
             ),
+
             "start_seconds": float(
                 boundary["start_seconds"]
             ),
+
             "end_seconds": float(
                 boundary["end_seconds"]
             ),
+
             "duration_seconds": (
-                segment_duration
+                duration_seconds
             ),
-            "average_frame_duration_seconds": (
-                average_frame_duration
-            ),
-            "nominal_frame_duration_seconds": (
-                nominal_frame_duration_seconds
-            ),
+
             "soft_segment_mass": float(
                 soft_segment_masses[
                     index
                 ].item()
             ),
 
-            # Filled only when correct_target
-            # is provided.
+            # Filled later if reference exists.
             "target_phoneme": None,
+            "target_index": None,
             "alignment_operation": None,
             "correct": None,
         }
 
-        results.append(result)
+        segments.append(
+            segment
+        )
 
     # ============================================================
-    # Optional reference evaluation
+    # 8. Optional CTC reference evaluation
     # ============================================================
 
     evaluation = None
     alignment = None
 
     if correct_target is not None:
+
         alignment_result = (
             align_phoneme_sequences(
                 reference=correct_target,
-                hypothesis=(
-                    predicted_phonemes
-                ),
+                hypothesis=predicted_phonemes,
             )
         )
 
@@ -4741,186 +5380,295 @@ def test_external_audio(
             "alignment"
         ]
 
-        matches = alignment_result[
-            "matches"
-        ]
+        matches = int(
+            alignment_result["matches"]
+        )
 
-        substitutions = alignment_result[
-            "substitutions"
-        ]
+        substitutions = int(
+            alignment_result[
+                "substitutions"
+            ]
+        )
 
-        deletions = alignment_result[
-            "deletions"
-        ]
+        deletions = int(
+            alignment_result["deletions"]
+        )
 
-        insertions = alignment_result[
-            "insertions"
-        ]
+        insertions = int(
+            alignment_result["insertions"]
+        )
 
-        total_errors = alignment_result[
-            "total_errors"
-        ]
+        total_errors = int(
+            alignment_result[
+                "total_errors"
+            ]
+        )
 
         reference_count = len(
             correct_target
         )
 
-        alignment_length = (
-            matches
-            + substitutions
-            + deletions
-            + insertions
-        )
-
         phoneme_error_rate = (
             total_errors
-            / reference_count
+            / max(reference_count, 1)
         )
 
-        reference_match_accuracy = (
+        reference_match_rate = (
             matches
-            / reference_count
+            / max(reference_count, 1)
         )
 
-        alignment_accuracy = (
-            matches
-            / max(
-                alignment_length,
-                1,
-            )
+        count_error = abs(
+            ctc_predicted_count
+            - reference_count
         )
 
         exact_sequence = (
             total_errors == 0
         )
 
-        count_error = abs(
-            predicted_count
-            - reference_count
-        )
-
         evaluation = {
             "reference_count": (
                 reference_count
             ),
+
             "predicted_count": (
-                predicted_count
+                ctc_predicted_count
             ),
-            "count_error": count_error,
+
+            "count_error": (
+                count_error
+            ),
+
             "count_is_exact": (
                 count_error == 0
             ),
+
             "matches": matches,
+
             "substitutions": (
                 substitutions
             ),
-            "deletions": deletions,
-            "insertions": insertions,
+
+            "deletions": (
+                deletions
+            ),
+
+            "insertions": (
+                insertions
+            ),
+
             "total_errors": (
                 total_errors
             ),
+
             "phoneme_error_rate": (
                 phoneme_error_rate
             ),
-            "reference_match_accuracy": (
-                reference_match_accuracy
+
+            "reference_match_rate": (
+                reference_match_rate
             ),
-            "alignment_accuracy": (
-                alignment_accuracy
-            ),
+
             "exact_sequence": (
                 exact_sequence
             ),
         }
 
-        # Attach alignment results to the
-        # corresponding predicted segment.
-        for alignment_item in alignment:
-            hypothesis_index = (
-                alignment_item[
-                    "hypothesis_index"
-                ]
-            )
+        # --------------------------------------------------------
+        # Attach Levenshtein alignment to corresponding
+        # predicted segment.
+        # --------------------------------------------------------
+
+        for item in alignment:
+
+            hypothesis_index = item[
+                "hypothesis_index"
+            ]
 
             if hypothesis_index is None:
-                # Deletion has no predicted
-                # segment and therefore no boundary.
+                # Deleted target has no predicted
+                # phoneme and therefore no boundary.
                 continue
 
-            results[
+            if (
+                hypothesis_index
+                >= len(segments)
+            ):
+                raise RuntimeError(
+                    "Alignment hypothesis index "
+                    "is outside segment range."
+                )
+
+            segments[
                 hypothesis_index
             ][
                 "target_phoneme"
-            ] = alignment_item[
+            ] = item[
                 "target_phoneme"
             ]
 
-            results[
+            segments[
+                hypothesis_index
+            ][
+                "target_index"
+            ] = item[
+                "reference_index"
+            ]
+
+            segments[
                 hypothesis_index
             ][
                 "alignment_operation"
-            ] = alignment_item[
+            ] = item[
                 "operation"
             ]
 
-            results[
+            segments[
                 hypothesis_index
             ][
                 "correct"
             ] = (
-                alignment_item["operation"]
+                item["operation"]
                 == "match"
             )
 
     # ============================================================
-    # Final output
+    # 9. Useful segmentation sanity statistics
+    # ============================================================
+
+    durations = [
+        segment["duration_seconds"]
+        for segment in segments
+    ]
+
+    if durations:
+
+        mean_duration = float(
+            np.mean(durations)
+        )
+
+        median_duration = float(
+            np.median(durations)
+        )
+
+        minimum_duration = float(
+            np.min(durations)
+        )
+
+        maximum_duration = float(
+            np.max(durations)
+        )
+
+        zero_duration_segments = int(
+            sum(
+                duration <= 0.0
+                for duration in durations
+            )
+        )
+
+    else:
+
+        mean_duration = 0.0
+        median_duration = 0.0
+        minimum_duration = 0.0
+        maximum_duration = 0.0
+        zero_duration_segments = 0
+
+    segmentation_summary = {
+        "segment_count": (
+            len(segments)
+        ),
+
+        "mean_duration_seconds": (
+            mean_duration
+        ),
+
+        "median_duration_seconds": (
+            median_duration
+        ),
+
+        "minimum_duration_seconds": (
+            minimum_duration
+        ),
+
+        "maximum_duration_seconds": (
+            maximum_duration
+        ),
+
+        "zero_duration_segments": (
+            zero_duration_segments
+        ),
+    }
+
+    # ============================================================
+    # 10. Final output
     # ============================================================
 
     output = {
         "audio_path": audio_path,
+
         "sample_rate": sample_rate,
+
         "audio_samples": (
             original_num_samples
         ),
+
         "audio_duration_seconds": (
             audio_duration_seconds
         ),
+
         "encoder_frame_count": (
             hidden_length
         ),
+
         "nominal_frame_duration_seconds": (
             nominal_frame_duration_seconds
         ),
-        "raw_predicted_count": (
-            raw_predicted_count
-        ),
+
         "predicted_count": (
-            predicted_count
+            ctc_predicted_count
         ),
+
+        "predicted_phoneme_ids": (
+            predicted_ids
+        ),
+
         "predicted_phonemes": (
             predicted_phonemes
         ),
+
         "correct_target": (
             correct_target
         ),
+
         "evaluation": evaluation,
+
         "alignment": alignment,
-        "segments": results,
+
+        "segmentation_summary": (
+            segmentation_summary
+        ),
+
+        "segments": segments,
     }
 
     # ============================================================
-    # Print
+    # 11. Print results
     # ============================================================
 
     if print_result:
+
         print()
+        print("=" * 100)
+
         print(
             f"Audio: {audio_path}"
         )
 
         print(
-            f"Audio duration: "
-            f"{audio_duration_seconds:.3f} seconds"
+            f"Duration: "
+            f"{audio_duration_seconds:.3f} s"
         )
 
         print(
@@ -4929,155 +5677,327 @@ def test_external_audio(
         )
 
         print(
-            f"Raw predicted count: "
-            f"{raw_predicted_count:.3f}"
+            f"CTC predicted count: "
+            f"{ctc_predicted_count}"
         )
 
         print(
-            f"Selected phoneme count: "
-            f"{predicted_count}"
-        )
-
-        print(
-            f"Nominal frame duration: "
+            f"Nominal encoder frame: "
             f"{nominal_frame_duration_seconds * 1000:.2f} ms"
         )
 
+        # --------------------------------------------------------
+        # Recognition metrics
+        # --------------------------------------------------------
+
         if evaluation is not None:
+
             print()
-            print("Reference evaluation")
+            print(
+                "CTC recognition evaluation"
+            )
+            print("-" * 50)
 
             print(
-                f"Target count: "
+                f"Reference count : "
                 f"{evaluation['reference_count']}"
             )
 
             print(
-                f"Count error: "
+                f"Predicted count : "
+                f"{evaluation['predicted_count']}"
+            )
+
+            print(
+                f"Count error     : "
                 f"{evaluation['count_error']}"
             )
 
             print(
-                f"Matches: "
+                f"Matches         : "
                 f"{evaluation['matches']}"
             )
 
             print(
-                f"Substitutions: "
+                f"Substitutions   : "
                 f"{evaluation['substitutions']}"
             )
 
             print(
-                f"Deletions: "
+                f"Deletions       : "
                 f"{evaluation['deletions']}"
             )
 
             print(
-                f"Insertions: "
+                f"Insertions      : "
                 f"{evaluation['insertions']}"
             )
 
             print(
-                f"Phoneme error rate: "
+                f"PER             : "
                 f"{evaluation['phoneme_error_rate']:.2%}"
             )
 
             print(
-                f"Reference match accuracy: "
-                f"{evaluation['reference_match_accuracy']:.2%}"
+                f"Match rate      : "
+                f"{evaluation['reference_match_rate']:.2%}"
             )
 
             print(
-                f"Alignment accuracy: "
-                f"{evaluation['alignment_accuracy']:.2%}"
-            )
-
-            print(
-                f"Exact sequence: "
+                f"Exact sequence  : "
                 f"{evaluation['exact_sequence']}"
             )
 
+        # --------------------------------------------------------
+        # Segmentation summary
+        # --------------------------------------------------------
+
         print()
         print(
-            "Predicted phoneme boundaries"
+            "Segmentation summary"
+        )
+        print("-" * 50)
+
+        print(
+            f"Segments        : "
+            f"{segmentation_summary['segment_count']}"
         )
 
-        print("=" * 145)
+        print(
+            f"Mean duration   : "
+            f"{mean_duration:.4f} s"
+        )
 
-        for result in results:
-            if evaluation is None:
-                alignment_text = (
-                    "not evaluated"
+        print(
+            f"Median duration : "
+            f"{median_duration:.4f} s"
+        )
+
+        print(
+            f"Min duration    : "
+            f"{minimum_duration:.4f} s"
+        )
+
+        print(
+            f"Max duration    : "
+            f"{maximum_duration:.4f} s"
+        )
+
+        print(
+            f"Zero durations  : "
+            f"{zero_duration_segments}"
+        )
+
+        # --------------------------------------------------------
+        # Individual phonemes / boundaries
+        # --------------------------------------------------------
+
+        print()
+        print(
+            "Predicted phonemes and boundaries"
+        )
+        
+        print("=" * 155)
+        
+        # ============================================================
+        # If reference exists, print using the alignment.
+        #
+        # This is important because deletions have no predicted
+        # segment and therefore would otherwise disappear.
+        # ============================================================
+        
+        if alignment is not None:
+        
+            row_index = 0
+        
+            for item in alignment:
+            
+                operation = item[
+                    "operation"
+                ]
+        
+                target_phoneme = item[
+                    "target_phoneme"
+                ]
+        
+                predicted_phoneme = item[
+                    "predicted_phoneme"
+                ]
+        
+                target_arabic = (
+                    phoneme_to_arabic_text(
+                        target_phoneme
+                    )
                 )
-
-                target_text = "-"
-            else:
-                alignment_text = (
-                    result[
-                        "alignment_operation"
+        
+                predicted_arabic = (
+                    phoneme_to_arabic_text(
+                        predicted_phoneme
+                    )
+                )
+        
+                hypothesis_index = item[
+                    "hypothesis_index"
+                ]
+        
+                # ========================================================
+                # DELETION / MISSING PHONEME
+                # ========================================================
+        
+                if hypothesis_index is None:
+                
+                    print(
+                        f"{row_index:03d} | "
+                        f"target="
+                        f"{str(target_phoneme):<10} "
+                        f"({target_arabic:<5}) | "
+                        f"pred="
+                        f"{'<MISSING>':<10} "
+                        f"({'-':<5}) | "
+                        f"{'MISSING':<11} | "
+                        f"time=[   -----,    -----) | "
+                        f"duration=  ----- | "
+                        f"frames= ---"
+                    )
+        
+                    row_index += 1
+        
+                    continue
+                
+                # ========================================================
+                # MATCH / SUBSTITUTE / INSERT
+                # ========================================================
+        
+                segment = segments[
+                    hypothesis_index
+                ]
+        
+                # For insertion there is no reference phoneme.
+                if target_phoneme is None:
+                
+                    target_display = "-"
+                    target_arabic = "-"
+        
+                else:
+                
+                    target_display = (
+                        target_phoneme
+                    )
+        
+                predicted_display = (
+                    predicted_phoneme
+                )
+        
+                print(
+                    f"{row_index:03d} | "
+                    f"target="
+                    f"{str(target_display):<10} "
+                    f"({target_arabic:<5}) | "
+                    f"pred="
+                    f"{str(predicted_display):<10} "
+                    f"({predicted_arabic:<5}) | "
+                    f"{operation:<11} | "
+                    f"time=["
+                    f"{segment['start_seconds']:7.3f}, "
+                    f"{segment['end_seconds']:7.3f}) | "
+                    f"duration="
+                    f"{segment['duration_seconds']:7.3f}s | "
+                    f"frames="
+                    f"{segment['frame_count']:3d}"
+                )
+        
+                row_index += 1
+        
+        
+        # ============================================================
+        # No reference target:
+        # just print autonomous predictions.
+        # ============================================================
+        
+        else:
+        
+            for segment in segments:
+            
+                predicted_phoneme = (
+                    segment[
+                        "predicted_phoneme"
                     ]
-                    or "insertion"
                 )
-
-                target_text = (
-                    result["target_phoneme"]
-                    if result["target_phoneme"]
-                    is not None
-                    else "-"
+        
+                predicted_arabic = (
+                    phoneme_to_arabic_text(
+                        predicted_phoneme
+                    )
                 )
+        
+                print(
+                    f"{segment['index']:03d} | "
+                    f"target="
+                    f"{'-':<10} "
+                    f"({'-':<5}) | "
+                    f"pred="
+                    f"{predicted_phoneme:<10} "
+                    f"({predicted_arabic:<5}) | "
+                    f"{'-':<11} | "
+                    f"time=["
+                    f"{segment['start_seconds']:7.3f}, "
+                    f"{segment['end_seconds']:7.3f}) | "
+                    f"duration="
+                    f"{segment['duration_seconds']:7.3f}s | "
+                    f"frames="
+                    f"{segment['frame_count']:3d}"
+                )
+        
+        print("=" * 155)
+        
 
-            print(
-                f"{result['index']:03d} | "
-                f"target={target_text:<9} | "
-                f"pred={result['predicted_phoneme']:<9} | "
-                f"{alignment_text:<11} | "
-                f"confidence={result['confidence']:.3f} | "
-                f"frames=["
-                f"{result['start_frame']:4d}, "
-                f"{result['end_frame']:4d}) | "
-                f"count={result['frame_count']:3d} | "
-                f"time=["
-                f"{result['start_seconds']:7.3f}, "
-                f"{result['end_seconds']:7.3f}) s | "
-                f"duration="
-                f"{result['duration_seconds']:6.3f} s | "
-                f"soft_mass="
-                f"{result['soft_segment_mass']:6.2f}"
-            )
-
-        print("=" * 145)
+        # --------------------------------------------------------
+        # Show deletions separately because deletions
+        # have no predicted boundary.
+        # --------------------------------------------------------
 
         if (
-            evaluation is not None
+            alignment is not None
             and evaluation["deletions"] > 0
         ):
+
             print()
             print(
-                "Deleted target phonemes:"
+                "Deleted reference phonemes"
             )
+            print("-" * 50)
 
-            for alignment_item in alignment:
+            for item in alignment:
+
                 if (
-                    alignment_item[
-                        "operation"
-                    ]
+                    item["operation"]
                     == "delete"
                 ):
                     print(
-                        f"target index "
-                        f"{alignment_item['reference_index']:03d} | "
-                        f"phoneme="
-                        f"{alignment_item['target_phoneme']}"
+                        f"reference index "
+                        f"{item['reference_index']:03d} | "
+                        f"{item['target_phoneme']}"
                     )
 
-        if correct_target is not None:
-            print()
-            print("Correct target:")
-            print(correct_target)
+        print()
+        print(
+            "Reference phonemes:"
+        )
+        print(
+            correct_target
+            if correct_target is not None
+            else "-"
+        )
 
         print()
-        print("Predicted phonemes:")
-        print(predicted_phonemes)
+        print(
+            "Predicted phonemes:"
+        )
+        print(
+            predicted_phonemes
+        )
+
+        print("=" * 100)
 
     return output
 
@@ -5109,28 +6029,927 @@ def test_external_audio(
 # print(f"Saved {audio_path}")
 
 # %%
-# item = val_df.iloc[1]
-# audio_path =  f"../../datasets/Quran_ds/Quran_ds/audio/audio/{item['path_of_audio']}"
-# target_phonemes = ast.literal_eval(item['phonemes'])
+item = val_df.iloc[1]
+
+audio_path = (
+    "../../datasets/Quran_ds/"
+    "Quran_ds/audio/audio/"
+    + item["path_of_audio"]
+)
+
+target_phonemes = ast.literal_eval(
+    item["phonemes"]
+)
 
 
-# # audio_path =  "../../datasets/test_audios/1.wav"
+# audio_path =  "../../datasets/test_audios/002004.wav"
 
 
-# # audio_path = "../../datasets/QDAT_Quran_DS/FINAL SOUND/FINAL SOUND/S10_1.wav"
-# # target_phonemes =['qaa', 'luu', 'su', 'bK', 'ħaa', 'na', 'ka', 'laa', 'ʕi', 'l', 'ma', 'la', 'naa', 'ʔi', 'l', 'laa', 'maa', 'ʕa', 'l', 'la', 'm', 'ta', 'naa', 'ʔi', 'nn', 'na', 'ka', 'ʔa', 'nt', 'ta', 'l', 'ʕa', 'lii', 'mu', 'l', 'ħa', 'kii', 'm']
+# audio_path = "../../datasets/QDAT_Quran_DS/FINAL SOUND/FINAL SOUND/S0_1.wav"
+# target_phonemes = ['qaa', 'luu', 'laa', 'ʕi', 'l', 'ma', 'la', 'naa', 'ʔi', 'nn', 'na', 'ka', 'ʔa', 'nt', 'ta', 'ʕa', 'l', 'laa', 'mu', 'l', 'ɣu', 'yuu', 'bK']
 
-# print(f"Audio path: {audio_path}")
-# print(f"Target phonemes: {target_phonemes}")
+print(f"Audio path: {audio_path}")
+print(f"Target phonemes: {target_phonemes}")
 
 # %%
-# output = test_external_audio(
-#     audio_path=audio_path,
+output = test_external_audio(
+    audio_path=audio_path,
+    model=model,
+    accelerator=accelerator,
+    id_to_phoneme=id_to_phoneme,
+    phoneme_to_id=phoneme_to_id,
+    # correct_target=target_phonemes,
+)
+
+# %%
+@torch.inference_mode()
+def evaluate_external_dataset(
+    csv_path,
+    audio_path,
+    model,
+    accelerator,
+    phoneme_to_id,
+    audio_path_1=None,
+    max_duration=45.0,
+    max_padded_audio_seconds=20.0,
+    print_results=True,
+):
+    """
+    Evaluate the trained model on an external dataset.
+
+    Expected CSV columns:
+        path_of_audio
+        phonemes
+
+    Optional columns:
+        duration
+        ds_index
+
+    Returns:
+        CTC loss
+        PER
+        phoneme accuracy
+        aligned match rate
+        exact sequence accuracy
+        substitutions
+        deletions
+        insertions
+        matches
+        reference phoneme count
+        predicted phoneme count
+        mean count error
+        exact count accuracy
+        segment loss
+        segment accuracy
+
+    Notes:
+        - No augmentation is used.
+        - Segment accuracy is an auxiliary classifier metric,
+          NOT true boundary accuracy.
+        - True timing accuracy requires reference boundaries.
+    """
+
+    # ============================================================
+    # 1. Load dataframe
+    # ============================================================
+
+    dataframe = pd.read_csv(
+        csv_path
+    )
+
+    required_columns = {
+        "path_of_audio",
+        "phonemes",
+    }
+
+    missing_columns = (
+        required_columns
+        - set(dataframe.columns)
+    )
+
+    if missing_columns:
+        raise ValueError(
+            "Missing required CSV columns: "
+            f"{sorted(missing_columns)}"
+        )
+
+    original_dataset_size = len(
+        dataframe
+    )
+
+    if original_dataset_size == 0:
+        raise ValueError(
+            "The dataset is empty."
+        )
+
+    # ============================================================
+    # 2. Print duration information
+    # ============================================================
+
+    if (
+        "duration"
+        in dataframe.columns
+    ):
+
+        if (
+            print_results
+            and accelerator.is_main_process
+        ):
+
+            print()
+            print(
+                "External dataset duration statistics"
+            )
+            print("-" * 50)
+
+            print(
+                f"Samples before filtering : "
+                f"{len(dataframe)}"
+            )
+
+            print(
+                f"Minimum duration         : "
+                f"{dataframe['duration'].min():.2f}s"
+            )
+
+            print(
+                f"Mean duration            : "
+                f"{dataframe['duration'].mean():.2f}s"
+            )
+
+            print(
+                f"Maximum duration         : "
+                f"{dataframe['duration'].max():.2f}s"
+            )
+
+    # ============================================================
+    # 3. Filter very long recordings
+    # ============================================================
+
+    if (
+        max_duration is not None
+        and "duration" in dataframe.columns
+    ):
+
+        dataframe = dataframe[
+            dataframe["duration"]
+            <= max_duration
+        ].reset_index(
+            drop=True
+        )
+
+        removed_count = (
+            original_dataset_size
+            - len(dataframe)
+        )
+
+        if (
+            print_results
+            and accelerator.is_main_process
+        ):
+
+            print(
+                f"Removed recordings > "
+                f"{max_duration:.1f}s : "
+                f"{removed_count}"
+            )
+
+            print(
+                f"Samples after filtering  : "
+                f"{len(dataframe)}"
+            )
+
+    if len(dataframe) == 0:
+        raise ValueError(
+            "No samples remain after duration filtering."
+        )
+
+    # ============================================================
+    # 4. Audio path fallback
+    # ============================================================
+
+    if audio_path_1 is None:
+        audio_path_1 = audio_path
+
+    # ============================================================
+    # 5. Dataset
+    # ============================================================
+
+    dataset = TajweedCTCDataset(
+        dataframe=dataframe,
+        dataset_path=audio_path,
+        dataset_path_1=audio_path_1,
+        phoneme_to_id=phoneme_to_id,
+        training=False,
+    )
+
+    # ============================================================
+    # 6. Safe evaluation batch budget
+    # ============================================================
+
+    evaluation_max_padded_samples = int(
+        SR
+        * max_padded_audio_seconds
+    )
+
+    sampler = DynamicBatchSampler(
+        dataset=dataset,
+        max_padded_samples_per_batch=(
+            evaluation_max_padded_samples
+        ),
+        shuffle=False,
+        minimum_speed_factor=1.0,
+    )
+
+    loader = DataLoader(
+        dataset,
+        batch_sampler=sampler,
+        collate_fn=ctc_collate,
+        num_workers=NUM_WORKERS,
+        pin_memory=(
+            torch.cuda.is_available()
+        ),
+        persistent_workers=(
+            NUM_WORKERS > 0
+        ),
+    )
+
+    loader = accelerator.prepare(
+        loader
+    )
+
+    # ============================================================
+    # 7. Evaluation mode
+    # ============================================================
+
+    model.eval()
+
+    # ============================================================
+    # 8. Accumulators
+    # ============================================================
+
+    total_substitutions = 0
+    total_deletions = 0
+    total_insertions = 0
+    total_matches = 0
+
+    total_reference_phonemes = 0
+    total_predicted_phonemes = 0
+
+    exact_sequences = 0
+    total_sequences = 0
+
+    total_count_error = 0
+    exact_count_sequences = 0
+
+    total_ctc_loss = 0.0
+
+    total_segment_loss = 0.0
+    total_segment_correct = 0
+    total_segment_phonemes = 0
+
+    # ============================================================
+    # 9. Evaluation loop
+    # ============================================================
+
+    progress = tqdm(
+        loader,
+        desc="Evaluating external dataset",
+        disable=(
+            not accelerator.is_local_main_process
+        ),
+    )
+
+    for (
+        waveforms,
+        targets,
+        input_lengths,
+        target_lengths,
+    ) in progress:
+
+        # ========================================================
+        # Forward
+        #
+        # target_lengths are supplied here ONLY so we can
+        # measure segmentation loss and auxiliary accuracy.
+        #
+        # CTC recognition remains autonomous.
+        # ========================================================
+
+        with accelerator.autocast():
+
+            (
+                ctc_logits,
+                segment_logits_batch,
+                segment_lengths,
+                hard_boundaries_batch,
+                hidden_lengths,
+            ) = model(
+                waveforms,
+                input_lengths,
+                target_lengths=target_lengths,
+            )
+
+            # ====================================================
+            # CTC loss
+            # ====================================================
+
+            ctc_loss = compute_ctc_loss(
+                ctc_logits=ctc_logits,
+                targets=targets,
+                target_lengths=target_lengths,
+                hidden_lengths=hidden_lengths,
+            )
+
+            # ====================================================
+            # Segment loss
+            # ====================================================
+
+            segment_loss = segmentation_loss(
+                logits_batch=(
+                    segment_logits_batch
+                ),
+                targets=targets,
+                target_lengths=target_lengths,
+            )
+
+        # ========================================================
+        # 10. Autonomous CTC decode
+        # ========================================================
+
+        predicted_batch = greedy_ctc_decode(
+            ctc_logits=ctc_logits,
+            hidden_lengths=hidden_lengths,
+        )
+
+        # ========================================================
+        # 11. Loss accumulation
+        # ========================================================
+
+        batch_phoneme_count = int(
+            target_lengths.sum().item()
+        )
+
+        total_ctc_loss += (
+            float(
+                ctc_loss
+                .detach()
+                .item()
+            )
+            * batch_phoneme_count
+        )
+
+        total_segment_loss += (
+            float(
+                segment_loss
+                .detach()
+                .item()
+            )
+            * batch_phoneme_count
+        )
+
+        # ========================================================
+        # 12. Segment classifier accuracy
+        # ========================================================
+
+        for (
+            batch_index,
+            segment_logits,
+        ) in enumerate(
+            segment_logits_batch
+        ):
+
+            reference_length = int(
+                target_lengths[
+                    batch_index
+                ].item()
+            )
+
+            segment_predictions = (
+                torch.argmax(
+                    segment_logits,
+                    dim=-1,
+                )
+            )
+
+            segment_targets = (
+                targets[
+                    batch_index,
+                    :reference_length,
+                ]
+                .to(
+                    segment_predictions.device
+                )
+            )
+
+            total_segment_correct += int(
+                (
+                    segment_predictions
+                    == segment_targets
+                )
+                .sum()
+                .item()
+            )
+
+            total_segment_phonemes += (
+                reference_length
+            )
+
+        # ========================================================
+        # 13. CTC sequence metrics
+        # ========================================================
+
+        for (
+            batch_index,
+            predicted_ids,
+        ) in enumerate(
+            predicted_batch
+        ):
+
+            reference_length = int(
+                target_lengths[
+                    batch_index
+                ].item()
+            )
+
+            reference_ids = (
+                targets[
+                    batch_index,
+                    :reference_length,
+                ]
+                .detach()
+                .cpu()
+                .tolist()
+            )
+
+            predicted_ids = list(
+                predicted_ids
+            )
+
+            alignment = levenshtein_counts(
+                reference=reference_ids,
+                hypothesis=predicted_ids,
+            )
+
+            substitutions = int(
+                alignment[
+                    "substitutions"
+                ]
+            )
+
+            deletions = int(
+                alignment[
+                    "deletions"
+                ]
+            )
+
+            insertions = int(
+                alignment[
+                    "insertions"
+                ]
+            )
+
+            matches = int(
+                alignment[
+                    "matches"
+                ]
+            )
+
+            total_substitutions += (
+                substitutions
+            )
+
+            total_deletions += (
+                deletions
+            )
+
+            total_insertions += (
+                insertions
+            )
+
+            total_matches += (
+                matches
+            )
+
+            total_reference_phonemes += (
+                len(reference_ids)
+            )
+
+            total_predicted_phonemes += (
+                len(predicted_ids)
+            )
+
+            errors = (
+                substitutions
+                + deletions
+                + insertions
+            )
+
+            exact_sequences += int(
+                errors == 0
+            )
+
+            total_sequences += 1
+
+            reference_count = len(
+                reference_ids
+            )
+
+            predicted_count = len(
+                predicted_ids
+            )
+
+            count_error = abs(
+                predicted_count
+                - reference_count
+            )
+
+            total_count_error += (
+                count_error
+            )
+
+            exact_count_sequences += int(
+                count_error == 0
+            )
+
+        # ========================================================
+        # 14. Explicit GPU cleanup
+        # ========================================================
+
+        del ctc_logits
+        del segment_logits_batch
+        del segment_lengths
+        del hard_boundaries_batch
+        del hidden_lengths
+        del ctc_loss
+        del segment_loss
+        del predicted_batch
+
+        del waveforms
+        del targets
+        del input_lengths
+        del target_lengths
+
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
+
+    # ============================================================
+    # 15. Reduce across processes
+    # ============================================================
+
+    statistics = torch.tensor(
+        [
+            total_substitutions,
+            total_deletions,
+            total_insertions,
+            total_matches,
+
+            total_reference_phonemes,
+            total_predicted_phonemes,
+
+            exact_sequences,
+            total_sequences,
+
+            total_count_error,
+            exact_count_sequences,
+
+            total_ctc_loss,
+            total_segment_loss,
+
+            total_segment_correct,
+            total_segment_phonemes,
+        ],
+        dtype=torch.float64,
+        device=accelerator.device,
+    )
+
+    statistics = accelerator.reduce(
+        statistics,
+        reduction="sum",
+    )
+
+    # ============================================================
+    # 16. Extract values
+    # ============================================================
+
+    substitutions = int(
+        statistics[0].item()
+    )
+
+    deletions = int(
+        statistics[1].item()
+    )
+
+    insertions = int(
+        statistics[2].item()
+    )
+
+    matches = int(
+        statistics[3].item()
+    )
+
+    reference_phonemes = max(
+        int(
+            statistics[4].item()
+        ),
+        1,
+    )
+
+    predicted_phonemes = int(
+        statistics[5].item()
+    )
+
+    exact_sequence_count = int(
+        statistics[6].item()
+    )
+
+    sequence_count = max(
+        int(
+            statistics[7].item()
+        ),
+        1,
+    )
+
+    count_error_sum = int(
+        statistics[8].item()
+    )
+
+    exact_count_count = int(
+        statistics[9].item()
+    )
+
+    ctc_loss_sum = float(
+        statistics[10].item()
+    )
+
+    segment_loss_sum = float(
+        statistics[11].item()
+    )
+
+    segment_correct = int(
+        statistics[12].item()
+    )
+
+    segment_phoneme_count = max(
+        int(
+            statistics[13].item()
+        ),
+        1,
+    )
+
+    # ============================================================
+    # 17. Final metrics
+    # ============================================================
+
+    total_errors = (
+        substitutions
+        + deletions
+        + insertions
+    )
+
+    phoneme_error_rate = (
+        total_errors
+        / reference_phonemes
+    )
+
+    phoneme_accuracy = max(
+        0.0,
+        1.0 - phoneme_error_rate,
+    )
+
+    aligned_match_rate = (
+        matches
+        / reference_phonemes
+    )
+
+    exact_sequence_accuracy = (
+        exact_sequence_count
+        / sequence_count
+    )
+
+    mean_count_error = (
+        count_error_sum
+        / sequence_count
+    )
+
+    exact_count_accuracy = (
+        exact_count_count
+        / sequence_count
+    )
+
+    average_ctc_loss = (
+        ctc_loss_sum
+        / reference_phonemes
+    )
+
+    average_segment_loss = (
+        segment_loss_sum
+        / segment_phoneme_count
+    )
+
+    segment_accuracy = (
+        segment_correct
+        / segment_phoneme_count
+    )
+
+    # ============================================================
+    # 18. Results dictionary
+    # ============================================================
+
+    results = {
+        "dataset_samples": (
+            sequence_count
+        ),
+
+        "ctc_loss": (
+            average_ctc_loss
+        ),
+
+        "phoneme_error_rate": (
+            phoneme_error_rate
+        ),
+
+        "phoneme_accuracy": (
+            phoneme_accuracy
+        ),
+
+        "aligned_match_rate": (
+            aligned_match_rate
+        ),
+
+        "exact_sequence_accuracy": (
+            exact_sequence_accuracy
+        ),
+
+        "substitutions": (
+            substitutions
+        ),
+
+        "deletions": (
+            deletions
+        ),
+
+        "insertions": (
+            insertions
+        ),
+
+        "matches": (
+            matches
+        ),
+
+        "total_errors": (
+            total_errors
+        ),
+
+        "reference_phonemes": (
+            reference_phonemes
+        ),
+
+        "predicted_phonemes": (
+            predicted_phonemes
+        ),
+
+        "mean_count_error": (
+            mean_count_error
+        ),
+
+        "exact_count_accuracy": (
+            exact_count_accuracy
+        ),
+
+        "segment_loss": (
+            average_segment_loss
+        ),
+
+        "segment_accuracy": (
+            segment_accuracy
+        ),
+    }
+
+    # ============================================================
+    # 19. Print
+    # ============================================================
+
+    if (
+        print_results
+        and accelerator.is_main_process
+    ):
+
+        print()
+        print("=" * 70)
+        print(
+            "EXTERNAL DATASET EVALUATION"
+        )
+        print("=" * 70)
+
+        print(
+            f"Samples                : "
+            f"{sequence_count}"
+        )
+
+        print()
+
+        print(
+            "CTC recognition"
+        )
+        print("-" * 50)
+
+        print(
+            f"CTC loss               : "
+            f"{average_ctc_loss:.4f}"
+        )
+
+        print(
+            f"PER                    : "
+            f"{phoneme_error_rate:.2%}"
+        )
+
+        print(
+            f"Phoneme accuracy       : "
+            f"{phoneme_accuracy:.2%}"
+        )
+
+        print(
+            f"Aligned match rate     : "
+            f"{aligned_match_rate:.2%}"
+        )
+
+        print(
+            f"Exact sequence accuracy: "
+            f"{exact_sequence_accuracy:.2%}"
+        )
+
+        print(
+            f"Substitutions          : "
+            f"{substitutions}"
+        )
+
+        print(
+            f"Deletions              : "
+            f"{deletions}"
+        )
+
+        print(
+            f"Insertions             : "
+            f"{insertions}"
+        )
+
+        print(
+            f"Matches                : "
+            f"{matches}"
+        )
+
+        print(
+            f"Reference phonemes     : "
+            f"{reference_phonemes}"
+        )
+
+        print(
+            f"Predicted phonemes     : "
+            f"{predicted_phonemes}"
+        )
+
+        print(
+            f"Mean count error       : "
+            f"{mean_count_error:.4f}"
+        )
+
+        print(
+            f"Exact count accuracy   : "
+            f"{exact_count_accuracy:.2%}"
+        )
+
+        print()
+
+        print(
+            "Segmentation auxiliary evaluation"
+        )
+        print("-" * 50)
+
+        print(
+            f"Segment loss           : "
+            f"{average_segment_loss:.4f}"
+        )
+
+        print(
+            f"Segment accuracy       : "
+            f"{segment_accuracy:.2%}"
+        )
+
+        print("=" * 70)
+
+    return results
+
+# %%
+# metrics = evaluate_external_dataset(
+#     csv_path= '../../datasets/Quran_ds/validation_df_v1.csv',
+#     audio_path=DATASET_PATH,
 #     model=model,
 #     accelerator=accelerator,
-#     id_to_phoneme=id_to_phoneme,
 #     phoneme_to_id=phoneme_to_id,
-#     correct_target=target_phonemes,
+
+#     max_duration=45,
+#     max_padded_audio_seconds=20,
 # )
 
 
